@@ -31,7 +31,7 @@ A Claude Code plugin that opens a pane inside Claude Code showing **which sessio
 在终端版 `claude` 里执行一次：
 
 ```
-/plugin install usage-lens --marketplace <owner>/usage-lens
+/plugin install usage-lens --marketplace fivefivekai666/usage-lens
 ```
 
 先答 `y` 添加 marketplace，再选安装范围（建议 user）。装好后桌面端的会话也能用。
