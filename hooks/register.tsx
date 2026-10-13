@@ -17,7 +17,7 @@ const scanAtom = atom({ plugin: 'usage-lens', key: 'scan' } as const, { isBusy: 
 const expandedAtom = atom({ plugin: 'usage-lens', key: 'expanded' } as const, [])
 const selfAtom = atom({ plugin: 'usage-lens', key: 'self' } as const, '')
 const bandAtom = atom({ plugin: 'usage-lens', key: 'band' } as const, null)
-const bandOffAtom = atom({ plugin: 'usage-lens', key: 'isBandOff' } as const, false)
+const bandOnAtom = atom({ plugin: 'usage-lens', key: 'isBandOn' } as const, false)
 const BAND_MIN_MS = 90e3
 
 // The reference categorical palette (dataviz skill), light steps; dark steps in the SVG's own media query.
@@ -208,14 +208,6 @@ async function saveLimits($: EngineInterface, items: readonly SessionRateLimit[]
   const limits: Limits = { at, items: items.map(l => ({ kind: l.kind, percentUsed: l.percentUsed, resetsAt: l.resetsAt })) }
   await update($, limitsAtom, () => limits)
   await $.store.set('limits', limits)
-  const five = limits.items.find(l => l.kind === 'five_hour')
-  const week = limits.items.find(l => l.kind === 'seven_day')
-  const left = five?.resetsAt ? Date.parse(five.resetsAt) - at : NaN
-  const parts = [
-    five ? `5h ${five.percentUsed}%${Number.isFinite(left) ? `（${duration(left)}后重置）` : ''}` : '',
-    week ? `7d ${week.percentUsed}%` : '',
-  ].filter(Boolean)
-  $.ui.status(parts.length ? parts.join(' · ') : undefined)
 }
 
 async function openPane($: EngineInterface) {
@@ -247,7 +239,7 @@ export function bandStat(report: Report, window: Limit, session: SessionUse | un
 // after a turn is measured, never while drawing.
 async function refreshBand($: EngineInterface) {
   const now = await $.clock.now()
-  if (isBandBusy || now - lastBandAt < BAND_MIN_MS || (await read($, bandOffAtom))) return
+  if (isBandBusy || now - lastBandAt < BAND_MIN_MS) return
   const { spec, window } = specFor({ kind: 'window5h' }, await read($, limitsAtom), now)
   if (!window) return
   isBandBusy = true
@@ -262,6 +254,26 @@ async function refreshBand($: EngineInterface) {
     isBandBusy = false
   }
 }
+
+// What the footer entry and the band draw: the windows, and this session's points.
+async function readUsage($: EngineInterface) {
+  const limits = await read($, limitsAtom)
+  const band = await read($, bandAtom)
+  const five = limits?.items.find(l => l.kind === 'five_hour')
+  const week = limits?.items.find(l => l.kind === 'seven_day')
+  const resets = five?.resetsAt ? Date.parse(five.resetsAt) : NaN
+  const resetText = !Number.isFinite(resets)
+    ? ''
+    : band
+      ? `${clock(resets, band.tzOffset, false)}重置`
+      : `${duration(resets - (await $.clock.now()))}后重置`
+  const perPoint = band && band.percentUsed > 0 && band.windowCost > 0 ? band.windowCost / band.percentUsed : 0
+  const points = band && perPoint > 0 ? band.sessionCost / perPoint : undefined
+  const share = band && band.windowCost > 0 ? band.sessionCost / band.windowCost : 0
+  return { five, week, resetText, points, share }
+}
+
+const usageColor = (pct: number) => (pct >= 90 ? '#e34948' : pct >= 75 ? '#eda100' : undefined)
 
 async function openFromBand($: EngineInterface) {
   await openPane($)
@@ -357,18 +369,19 @@ export const register: Register = on => {
     await $.command.register({
       name: 'usage-lens',
       description: '用量透视：5h 窗口 / 任意时段内各 session 的用量占比，主 agent 与子 agent 的模型分布',
-      argumentHint: '[5h窗口|7d窗口|1h|5h|24h|today|7d|30d|10:00-14:00|3h|bar on|bar off]',
+      argumentHint: '[5h窗口|7d窗口|1h|5h|24h|today|7d|30d|10:00-14:00|3h|band on|band off]',
       immediate: true,
     })
     const id = await $.session.id()
     await update($, selfAtom, () => id)
-    const isOff = (await $.store.get('bandOff')) === true
-    await update($, bandOffAtom, () => isOff)
+    const isBandOn = (await $.store.get('bandOn')) === true
+    await update($, bandOnAtom, () => isBandOn)
+    $.ui.status(undefined)
     const stored = (await $.store.get('limits')) as Limits | undefined
     if (stored?.items) await update($, limitsAtom, held => (held && held.at > stored.at ? held : stored))
     const usage = await $.session.usage()
     await saveLimits($, usage.rateLimits)
-    if (!isOff) $.clock.after(2e3, () => refreshBand($))
+    $.clock.after(2e3, () => refreshBand($))
     return next(e)
   })
 
@@ -380,16 +393,12 @@ export const register: Register = on => {
 
   on('command.run', { command: 'usage-lens' }, async ($, e) => {
     const arg = e.args.trim()
-    const barArg = /^bar\s+(on|off)$/i.exec(arg)
-    if (barArg) {
-      const isOff = barArg[1]?.toLowerCase() === 'off'
-      await update($, bandOffAtom, () => isOff)
-      await $.store.set('bandOff', isOff)
-      if (!isOff) {
-        lastBandAt = 0
-        await refreshBand($)
-      }
-      return { text: isOff ? '已关闭输入框上方的用量条（/usage-lens bar on 重新打开）。' : '已打开输入框上方的用量条。' }
+    const bandArg = /^(?:band|bar)\s+(on|off)$/i.exec(arg)
+    if (bandArg) {
+      const isOn = bandArg[1]?.toLowerCase() === 'on'
+      await update($, bandOnAtom, () => isOn)
+      await $.store.set('bandOn', isOn)
+      return { text: isOn ? '已打开输入框上方的用量条（/usage-lens band off 关掉）。' : '已关闭输入框上方的用量条。' }
     }
     const kind = ARG_KINDS[arg.toLowerCase()]
     if (arg || !(await read($, reportAtom))) {
@@ -410,25 +419,35 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // One clickable row above the prompt: the 5h window, the week, this session's
-  // share of the window; a press opens the pane on the 5h window.
+  // In the footer beside the model: the 5h window, the week, this session's
+  // points; a press opens the pane on the 5h window. The engine's own mode
+  // labels (focus, memory paused) stay after it.
+  on('ui.render', { component: 'SessionMode' }, async ($, e, next) => {
+    const { five, week, resetText, points } = await readUsage($)
+    if (!five && !week) return next(e)
+    const { Box, Button, Text } = $.ui.resolve(e)
+    return (
+      <Box flexDirection="row">
+        <Button key="usage-lens-footer" plain onPress={() => openFromBand($)}>
+          {five ? <Text dimColor>5h </Text> : ''}
+          {five ? <Text color={usageColor(five.percentUsed)} dimColor={!usageColor(five.percentUsed)}>{five.percentUsed}%</Text> : ''}
+          {five && resetText ? <Text dimColor>（{resetText}）</Text> : ''}
+          {week ? <Text dimColor>{five ? ' · ' : ''}7d </Text> : ''}
+          {week ? <Text color={usageColor(week.percentUsed)} dimColor={!usageColor(week.percentUsed)}>{week.percentUsed}%</Text> : ''}
+          {points !== undefined ? <Text dimColor> · 本会话≈{points.toFixed(1)}点</Text> : ''}
+        </Button>
+        {e.props.modes.length > 0 ? <Text dimColor> · {e.props.modes.join(' & ')}</Text> : null}
+      </Box>
+    )
+  })
+
+  // The same as one wider row above the prompt, for those who turn it on
+  // (/usage-lens band on); off by default.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (e.props.hasSurvey || (await read($, bandOffAtom))) return next(e)
-    const limits = await read($, limitsAtom)
-    const band = await read($, bandAtom)
+    if (e.props.hasSurvey || !(await read($, bandOnAtom))) return next(e)
+    const { five, week, resetText, points, share } = await readUsage($)
     const { Button, Text } = $.ui.resolve(e)
-    const five = limits?.items.find(l => l.kind === 'five_hour')
-    const week = limits?.items.find(l => l.kind === 'seven_day')
     const cols = e.props.bodyColumns
-    const resets = five?.resetsAt ? Date.parse(five.resetsAt) : NaN
-    const resetText = !Number.isFinite(resets)
-      ? ''
-      : band
-        ? `${clock(resets, band.tzOffset, false)} 重置`
-        : `${duration(resets - (await $.clock.now()))}后重置`
-    const perPoint = band && band.percentUsed > 0 && band.windowCost > 0 ? band.windowCost / band.percentUsed : 0
-    const points = band && perPoint > 0 ? band.sessionCost / perPoint : undefined
-    const share = band && band.windowCost > 0 ? band.sessionCost / band.windowCost : 0
     const b = bar((five?.percentUsed ?? 0) / 100, cols >= 100 ? 16 : cols >= 70 ? 10 : 6)
     const isWide = cols >= 64
     return (

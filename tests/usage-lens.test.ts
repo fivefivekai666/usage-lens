@@ -146,11 +146,12 @@ describe('band', () => {
     expect(bandStat(REPORT, { kind: 'five_hour', percentUsed: 40 }, undefined, NOW).sessionCost).toBe(0)
   })
 
-  test('the band is one button that opens the pane on the 5h window and scans', async ($, on) => {
+  test('the footer entry shows both windows beside the modes, and a press opens the pane', async ($, on) => {
     mock.clock(on, { now: NOW })
     mock.store(on)
     let opened = 0
     let scans = 0
+    on('session.measure', ($, e) => ({ changed: e.changed }))
     on('ui.open', () => {
       opened += 1
       return { value: { isPlaced: true } }
@@ -159,14 +160,36 @@ describe('band', () => {
       scans += 1
       return { value: { exitCode: 0, stdout: JSON.stringify(REPORT), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     })
+    await $.session.measure({
+      context: { window: 1_000_000 },
+      rateLimits: [
+        { kind: 'five_hour', percentUsed: 12, resetsAt: new Date(NOW + 4 * HOUR).toISOString() },
+        { kind: 'seven_day', percentUsed: 87 },
+      ],
+      changed: ['rateLimits'],
+    })
     for (const surface of ['desktop', 'terminal'] as const) {
-      const ui = await $.ui.mount({ plugin: 'usage-lens', surface, ...BAND })
-      const band = await ui.find({ key: 'usage-lens-band' })
-      expect(band?.text).toContain('▸ 展开')
-      await ui.press({ key: 'usage-lens-band' })
+      const ui = await $.ui.mount({ plugin: 'usage-lens', surface, component: 'SessionMode', props: { modes: ['focus'] } })
+      const entry = await ui.find({ key: 'usage-lens-footer' })
+      expect(entry?.text).toContain('5h 12%')
+      expect(entry?.text).toContain('7d 87%')
+      expect(await ui.find({ text: /focus/ })).toBeDefined()
+      await ui.press({ key: 'usage-lens-footer' })
       await ui.unmount()
     }
     expect(opened).toBe(2)
     expect(scans).toBe(2)
+  })
+
+  test('the band above the prompt is off until asked for', async ($, on) => {
+    mock.clock(on, { now: NOW })
+    mock.store(on)
+    on('session.measure', ($, e) => ({ changed: e.changed }))
+    await $.session.measure({ context: { window: 1_000_000 }, rateLimits: [{ kind: 'five_hour', percentUsed: 12 }], changed: ['rateLimits'] })
+    const answered = await $.command.run({ command: 'usage-lens', args: 'band on', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } })
+    expect(answered.text).toContain('已打开')
+    const ui = await $.ui.mount({ plugin: 'usage-lens', surface: 'desktop', ...BAND })
+    expect((await ui.find({ key: 'usage-lens-band' }))?.text).toContain('▸ 展开')
+    await ui.unmount()
   })
 })

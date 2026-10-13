@@ -55,7 +55,7 @@ declare module 'claude-code' {
       expanded: string[]
       self: string
       band: BandStat | null
-      isBandOff: boolean
+      isBandOn: boolean
     }
   }
 }
