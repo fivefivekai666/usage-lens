@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionRateLimit } from 'claude-code'
 
-import type { Limit, Limits, Metric, ModelUse, Range, RangeKind, Report, SessionUse, Use } from '../types'
+import type { BandStat, Limit, Limits, Metric, ModelUse, Range, RangeKind, Report, SessionUse, Use } from '../types'
 
 const PANE = 'usage-lens'
 const TITLE = '用量透视'
@@ -16,6 +16,9 @@ const limitsAtom = atom({ plugin: 'usage-lens', key: 'limits' } as const, null)
 const scanAtom = atom({ plugin: 'usage-lens', key: 'scan' } as const, { isBusy: false })
 const expandedAtom = atom({ plugin: 'usage-lens', key: 'expanded' } as const, [])
 const selfAtom = atom({ plugin: 'usage-lens', key: 'self' } as const, '')
+const bandAtom = atom({ plugin: 'usage-lens', key: 'band' } as const, null)
+const bandOffAtom = atom({ plugin: 'usage-lens', key: 'isBandOff' } as const, false)
+const BAND_MIN_MS = 90e3
 
 // The reference categorical palette (dataviz skill), light steps; dark steps in the SVG's own media query.
 const COLORS = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300', '#4a3aa7', '#e34948']
@@ -170,6 +173,11 @@ async function refresh($: EngineInterface): Promise<void> {
         if (note) report.note = note
         await update($, reportAtom, () => report)
         await update($, scanAtom, () => ({ isBusy: false, at: now }))
+        if (window?.kind === 'five_hour') {
+          const session = await findSelf($, report)
+          await update($, bandAtom, () => bandStat(report, window, session, now))
+          lastBandAt = now
+        }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
         await update($, scanAtom, s => ({ ...s, isBusy: false, error: message }))
@@ -214,6 +222,51 @@ async function openPane($: EngineInterface) {
   const opened = await $.ui.open({ id: PANE, title: TITLE })
   ensureTicker($)
   return opened.isPlaced
+}
+
+// ---------------------------------------------------------------- the band above the prompt
+
+let lastBandAt = 0
+let isBandBusy = false
+const findSelf = async ($: EngineInterface, report: Report) => {
+  const id = await read($, selfAtom)
+  return report.sessions.find(s => s.sid === id)
+}
+
+export function bandStat(report: Report, window: Limit, session: SessionUse | undefined, now: number): BandStat {
+  return {
+    at: now,
+    sessionCost: session?.all.cost ?? 0,
+    windowCost: report.total.cost,
+    percentUsed: window.percentUsed,
+    tzOffset: report.tzOffset,
+  }
+}
+
+// This session's cost in the current 5h window, rescanned at most every 90s:
+// after a turn is measured, never while drawing.
+async function refreshBand($: EngineInterface) {
+  const now = await $.clock.now()
+  if (isBandBusy || now - lastBandAt < BAND_MIN_MS || (await read($, bandOffAtom))) return
+  const { spec, window } = specFor({ kind: 'window5h' }, await read($, limitsAtom), now)
+  if (!window) return
+  isBandBusy = true
+  try {
+    const report = await runScan($, spec, 'cost')
+    lastBandAt = now
+    const session = await findSelf($, report)
+    await update($, bandAtom, () => bandStat(report, window, session, now))
+  } catch {
+    // the band keeps its last figures; the pane reports scan errors
+  } finally {
+    isBandBusy = false
+  }
+}
+
+async function openFromBand($: EngineInterface) {
+  await openPane($)
+  await update($, rangeAtom, (): Range => ({ kind: 'window5h' }))
+  await refresh($)
 }
 
 // ---------------------------------------------------------------- text summary (when no pane is drawn)
@@ -304,25 +357,40 @@ export const register: Register = on => {
     await $.command.register({
       name: 'usage-lens',
       description: '用量透视：5h 窗口 / 任意时段内各 session 的用量占比，主 agent 与子 agent 的模型分布',
-      argumentHint: '[5h窗口|7d窗口|1h|5h|24h|today|7d|30d|10:00-14:00|3h]',
+      argumentHint: '[5h窗口|7d窗口|1h|5h|24h|today|7d|30d|10:00-14:00|3h|bar on|bar off]',
       immediate: true,
     })
     const id = await $.session.id()
     await update($, selfAtom, () => id)
+    const isOff = (await $.store.get('bandOff')) === true
+    await update($, bandOffAtom, () => isOff)
     const stored = (await $.store.get('limits')) as Limits | undefined
     if (stored?.items) await update($, limitsAtom, held => (held && held.at > stored.at ? held : stored))
     const usage = await $.session.usage()
     await saveLimits($, usage.rateLimits)
+    if (!isOff) $.clock.after(2e3, () => refreshBand($))
     return next(e)
   })
 
   on('session.measure', async ($, e, next) => {
     if (e.changed.includes('rateLimits')) await saveLimits($, e.rateLimits)
+    $.clock.after(50, () => refreshBand($))
     return next(e)
   })
 
   on('command.run', { command: 'usage-lens' }, async ($, e) => {
     const arg = e.args.trim()
+    const barArg = /^bar\s+(on|off)$/i.exec(arg)
+    if (barArg) {
+      const isOff = barArg[1]?.toLowerCase() === 'off'
+      await update($, bandOffAtom, () => isOff)
+      await $.store.set('bandOff', isOff)
+      if (!isOff) {
+        lastBandAt = 0
+        await refreshBand($)
+      }
+      return { text: isOff ? '已关闭输入框上方的用量条（/usage-lens bar on 重新打开）。' : '已打开输入框上方的用量条。' }
+    }
     const kind = ARG_KINDS[arg.toLowerCase()]
     if (arg || !(await read($, reportAtom))) {
       await update($, rangeAtom, (): Range => (kind ? { kind } : { kind: 'custom', text: arg }))
@@ -340,6 +408,42 @@ export const register: Register = on => {
     ticker?.cancel()
     ticker = undefined
     return next(e)
+  })
+
+  // One clickable row above the prompt: the 5h window, the week, this session's
+  // share of the window; a press opens the pane on the 5h window.
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.props.hasSurvey || (await read($, bandOffAtom))) return next(e)
+    const limits = await read($, limitsAtom)
+    const band = await read($, bandAtom)
+    const { Button, Text } = $.ui.resolve(e)
+    const five = limits?.items.find(l => l.kind === 'five_hour')
+    const week = limits?.items.find(l => l.kind === 'seven_day')
+    const cols = e.props.bodyColumns
+    const resets = five?.resetsAt ? Date.parse(five.resetsAt) : NaN
+    const resetText = !Number.isFinite(resets)
+      ? ''
+      : band
+        ? `${clock(resets, band.tzOffset, false)} 重置`
+        : `${duration(resets - (await $.clock.now()))}后重置`
+    const perPoint = band && band.percentUsed > 0 && band.windowCost > 0 ? band.windowCost / band.percentUsed : 0
+    const points = band && perPoint > 0 ? band.sessionCost / perPoint : undefined
+    const share = band && band.windowCost > 0 ? band.sessionCost / band.windowCost : 0
+    const b = bar((five?.percentUsed ?? 0) / 100, cols >= 100 ? 16 : cols >= 70 ? 10 : 6)
+    const isWide = cols >= 64
+    return (
+      <Button key="usage-lens-band" plain onPress={() => openFromBand($)}>
+        <Text dimColor>用量 </Text>
+        {five ? <Text>5h </Text> : ''}
+        {five ? <Text color={five.percentUsed >= 80 ? '#e34948' : '#2a78d6'}>{b.on}</Text> : ''}
+        {five ? <Text dimColor>{b.off}</Text> : ''}
+        {five ? <Text bold> {five.percentUsed}%</Text> : <Text dimColor>还没有 5h 读数</Text>}
+        {isWide && resetText ? <Text dimColor> · {resetText}</Text> : ''}
+        {isWide && week ? <Text dimColor> · 7d {week.percentUsed}%</Text> : ''}
+        {points !== undefined ? <Text dimColor> · 本会话 ≈{points.toFixed(1)}点{isWide ? `（${percent(share)}）` : ''}</Text> : ''}
+        <Text color="#2a78d6"> ▸ 展开</Text>
+      </Button>
+    )
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {

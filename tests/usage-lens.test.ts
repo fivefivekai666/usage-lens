@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 
-import { modelName, specFor, summaryText } from '../hooks/register'
+import { bandStat, modelName, specFor, summaryText } from '../hooks/register'
 import type { Limits, Report } from '../types'
 
 const NOW = Date.parse('2026-10-13T06:00:00Z')
@@ -129,6 +129,44 @@ describe('pane', () => {
       await ui.press({ key: 'row-s-big' })
       await ui.unmount()
     }
+    expect(scans).toBe(2)
+  })
+})
+
+const BAND = {
+  component: 'AbovePrompt',
+  props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 100, scroll: { offset: 0, bodyRows: 10 }, view: {} },
+} as const
+
+describe('band', () => {
+  test("a session's points are its cost over the window's cost per percent", async () => {
+    const stat = bandStat(REPORT, { kind: 'five_hour', percentUsed: 40 }, REPORT.sessions[1], NOW)
+    // $40 for 40% -> $1 a point; the session spent $10
+    expect(stat.sessionCost / (stat.windowCost / stat.percentUsed)).toBe(10)
+    expect(bandStat(REPORT, { kind: 'five_hour', percentUsed: 40 }, undefined, NOW).sessionCost).toBe(0)
+  })
+
+  test('the band is one button that opens the pane on the 5h window and scans', async ($, on) => {
+    mock.clock(on, { now: NOW })
+    mock.store(on)
+    let opened = 0
+    let scans = 0
+    on('ui.open', () => {
+      opened += 1
+      return { value: { isPlaced: true } }
+    })
+    on('process.run', () => {
+      scans += 1
+      return { value: { exitCode: 0, stdout: JSON.stringify(REPORT), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    })
+    for (const surface of ['desktop', 'terminal'] as const) {
+      const ui = await $.ui.mount({ plugin: 'usage-lens', surface, ...BAND })
+      const band = await ui.find({ key: 'usage-lens-band' })
+      expect(band?.text).toContain('▸ 展开')
+      await ui.press({ key: 'usage-lens-band' })
+      await ui.unmount()
+    }
+    expect(opened).toBe(2)
     expect(scans).toBe(2)
   })
 })

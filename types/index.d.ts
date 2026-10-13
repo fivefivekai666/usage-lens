@@ -41,6 +41,8 @@ export type Report = {
   note?: string
 }
 export type Scan = { isBusy: boolean; error?: string; at?: number }
+// What the band above the prompt shows of this session in the current 5h window.
+export type BandStat = { at: number; sessionCost: number; windowCost: number; percentUsed: number; tzOffset: number }
 
 declare module 'claude-code' {
   interface PluginState {
@@ -52,6 +54,8 @@ declare module 'claude-code' {
       scan: Scan
       expanded: string[]
       self: string
+      band: BandStat | null
+      isBandOff: boolean
     }
   }
 }
