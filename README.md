@@ -6,6 +6,7 @@ A Claude Code plugin that opens a pane inside Claude Code showing **which sessio
 
 ## 能看到什么
 
+- **输入框上方的用量条**：一行常驻显示 5h 用量条、百分比、重置时间、7 天用量，以及本会话在这个 5h 窗口里大约占了几点。点一下就展开完整面板。不想要可以 `/usage-lens bar off` 关掉。
 - **官方 5h / 7 天额度的真实百分比**：读的是 Claude Code 从 API 响应里拿到的限额读数，不是估算。「5h窗口」时段按「重置时间 − 5 小时」到现在算，和官方窗口对齐。
 - **会话占比**：时段内每个 session 占总用量的百分比，按 API 等价成本或按 token 数排序。在 5h 窗口下每个 session 还标出「≈ N 点」：它大约吃掉了 5h 额度的几个百分点。
 - **点开一个 session**：
@@ -40,6 +41,7 @@ A Claude Code plugin that opens a pane inside Claude Code showing **which sessio
 /usage-lens                 # 打开面板，默认看当前 5h 窗口
 /usage-lens 24h             # 指定时段：5h窗口 7d窗口 1h 5h 24h today 7d 30d
 /usage-lens 10:00-14:00     # 自定义时段
+/usage-lens bar off         # 关掉输入框上方的用量条（bar on 重新打开）
 ```
 
 面板打开时每 60 秒自动刷新。面板放不下时（比如终端太窄），命令会改为在对话里输出一张汇总表。
