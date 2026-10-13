@@ -1,0 +1,13 @@
+{
+  "name": "usage-lens",
+  "owner": {
+    "name": "Dale Dai"
+  },
+  "description": "usage-lens: per-session share of the Claude Code 5h window, main agent vs subagents by model",
+  "plugins": [
+    {
+      "name": "usage-lens",
+      "source": "./"
+    }
+  ]
+}

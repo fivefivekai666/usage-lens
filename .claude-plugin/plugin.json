@@ -1,0 +1,10 @@
+{
+  "name": "usage-lens",
+  "version": "0.1.0",
+  "description": "用量透视：5 小时窗口或任意时段内，各 session 的用量占比，及每个 session 里主 agent / 子 agent 各用了多少、什么模型",
+  "author": {
+    "name": "Dale Dai"
+  },
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}
