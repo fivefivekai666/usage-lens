@@ -1,4 +1,4 @@
-import type { Metric, Use } from '../types'
+import type { Limit, Metric, Quota, Use } from '../types'
 
 export const HOUR = 3600e3
 export const DAY = 24 * HOUR
@@ -44,3 +44,33 @@ export const limitLabel = (kind: string) => (kind === 'five_hour' ? '5小时窗�
 
 // Theme keys, so a warning follows the person's theme: nothing below 75%.
 export const severity = (pct: number): 'warning' | 'error' | undefined => (pct >= 90 ? 'error' : pct >= 75 ? 'warning' : undefined)
+
+// ---------------------------------------------------------------- dollars left
+
+// Under this much of a window used, "cost so far over percent used" is mostly the
+// rounding of the percentage, so no estimate is given.
+export const MIN_ESTIMATE_PCT = 3
+
+// The API-equivalent dollars a window still holds, if what was spent so far is
+// `cost` and the account says `pct` percent of it is gone. A floor, not a figure:
+// only this machine's spend is in `cost`, while the percentage counts every device.
+export const remainingUsd = (cost: number, pct: number): number | null =>
+  pct >= 100 ? 0 : pct >= MIN_ESTIMATE_PCT && cost > 0 ? (cost * (100 - pct)) / pct : null
+
+export const usdShort = (n: number) => (n >= 10000 ? `$${(n / 1000).toFixed(0)}k` : n >= 1000 ? `$${(n / 1000).toFixed(1)}k` : usd(n))
+
+// The estimate for one window of `limits`, from the cost kept for that very window.
+export function windowRemaining(quota: Quota | null, limit: Limit): number | null {
+  const w = quota?.windows.find(x => x.kind === limit.kind && x.resetsAt === limit.resetsAt)
+  return w ? remainingUsd(w.cost, limit.percentUsed) : null
+}
+
+// The window that runs out first: the one with the fewest dollars left.
+export function tightest(quota: Quota | null, limits: readonly Limit[]): { limit: Limit; remaining: number } | undefined {
+  let best: { limit: Limit; remaining: number } | undefined
+  for (const limit of limits) {
+    const remaining = windowRemaining(quota, limit)
+    if (remaining !== null && (!best || remaining < best.remaining)) best = { limit, remaining }
+  }
+  return best
+}

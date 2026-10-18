@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionRateLimit } from 'claude-code'
 
-import type { BandStat, Limit, Limits, Metric, Range, RangeKind, Report, SessionUse } from '../types'
+import type { BandStat, Limit, Limits, Metric, Quota, QuotaWindow, Range, RangeKind, Report, SessionUse } from '../types'
 import { COLORS, meterColor, meterSvg } from './charts'
 import {
   DAY,
@@ -16,9 +16,12 @@ import {
   percent,
   severity,
   showValue,
+  tightest,
   tokens,
   usd,
+  usdShort,
   valueOf,
+  windowRemaining,
 } from './format'
 import { drawPane } from './pane'
 
@@ -36,8 +39,10 @@ const scanAtom = atom({ plugin: 'usage-lens', key: 'scan' } as const, { isBusy: 
 const expandedAtom = atom({ plugin: 'usage-lens', key: 'expanded' } as const, [])
 const selfAtom = atom({ plugin: 'usage-lens', key: 'self' } as const, '')
 const bandAtom = atom({ plugin: 'usage-lens', key: 'band' } as const, null)
+const quotaAtom = atom({ plugin: 'usage-lens', key: 'quota' } as const, null)
 const bandOnAtom = atom({ plugin: 'usage-lens', key: 'isBandOn' } as const, false)
 const BAND_MIN_MS = 90e3
+const WEEK_MIN_MS = 10 * 60e3
 
 const ROLLING: Partial<Record<RangeKind, number>> = { '1h': HOUR, '5h': 5 * HOUR, '24h': DAY, '7d': 7 * DAY, '30d': 30 * DAY }
 const ARG_KINDS: Record<string, RangeKind> = {
@@ -91,8 +96,8 @@ let inflight: Promise<void> | undefined
 let isAgain = false
 let ticker: { cancel: () => void } | undefined
 
-async function runScan($: EngineInterface, spec: string, metric: Metric): Promise<Report> {
-  const argv = [`${$.plugin.root}/bin/scan.mjs`, '--range', spec, '--metric', metric, '--limit', '40', '--agents', '10']
+async function runScan($: EngineInterface, spec: string, metric: Metric, limit = 40, agents = 10): Promise<Report> {
+  const argv = [`${$.plugin.root}/bin/scan.mjs`, '--range', spec, '--metric', metric, '--limit', String(limit), '--agents', String(agents)]
   let lastError: unknown
   for (const cmd of nodeCmd ? [nodeCmd] : NODE_CANDIDATES) {
     let ran
@@ -136,6 +141,7 @@ async function refresh($: EngineInterface): Promise<void> {
         if (note) report.note = note
         await update($, reportAtom, () => report)
         await update($, scanAtom, () => ({ isBusy: false, at: now }))
+        if (window) await putWindow($, { kind: window.kind, resetsAt: window.resetsAt, cost: report.total.cost }, now)
         if (window?.kind === 'five_hour') {
           const session = await findSelf($, report)
           await update($, bandAtom, () => bandStat(report, window, session, now))
@@ -179,6 +185,38 @@ async function openPane($: EngineInterface) {
   return opened.isPlaced
 }
 
+// ---------------------------------------------------------------- dollars left
+
+async function putWindow($: EngineInterface, w: QuotaWindow, at: number) {
+  await update(
+    $,
+    quotaAtom,
+    (q: Quota | null): Quota => ({ ...(q ?? { windows: [] }), at, windows: [...(q?.windows ?? []).filter(x => x.kind !== w.kind), w] }),
+  )
+}
+
+let lastWeekAt = 0
+let isWeekBusy = false
+
+// What this machine spent in the current 7-day window, rescanned at most every ten
+// minutes (the first scan reads a week of transcripts; later ones only what is new).
+async function refreshWeek($: EngineInterface) {
+  const now = await $.clock.now()
+  if (isWeekBusy || now - lastWeekAt < WEEK_MIN_MS) return
+  const { spec, window } = specFor({ kind: 'window7d' }, await read($, limitsAtom), now)
+  if (!window) return
+  isWeekBusy = true
+  try {
+    const report = await runScan($, spec, 'cost', 1, 0)
+    lastWeekAt = now
+    await putWindow($, { kind: 'seven_day', resetsAt: window.resetsAt, cost: report.total.cost }, now)
+  } catch {
+    // the estimate keeps its last figures
+  } finally {
+    isWeekBusy = false
+  }
+}
+
 // ---------------------------------------------------------------- the band above the prompt
 
 let lastBandAt = 0
@@ -211,6 +249,7 @@ async function refreshBand($: EngineInterface) {
     lastBandAt = now
     const session = await findSelf($, report)
     await update($, bandAtom, () => bandStat(report, window, session, now))
+    await putWindow($, { kind: 'five_hour', resetsAt: window.resetsAt, cost: report.total.cost }, now)
   } catch {
     // the band keeps its last figures; the pane reports scan errors
   } finally {
@@ -233,7 +272,8 @@ async function readUsage($: EngineInterface) {
   const perPoint = band && band.percentUsed > 0 && band.windowCost > 0 ? band.windowCost / band.percentUsed : 0
   const points = band && perPoint > 0 ? band.sessionCost / perPoint : undefined
   const share = band && band.windowCost > 0 ? band.sessionCost / band.windowCost : 0
-  return { five, week, resetText, points, share }
+  const left = tightest(await read($, quotaAtom), limits?.items.filter(l => l.kind === 'five_hour' || l.kind === 'seven_day') ?? [])
+  return { five, week, resetText, points, share, left }
 }
 
 async function openFromBand($: EngineInterface) {
@@ -244,14 +284,17 @@ async function openFromBand($: EngineInterface) {
 
 // ---------------------------------------------------------------- text summary (when no pane is drawn)
 
-export function summaryText(report: Report, limits: Limits | null, metric: Metric, self: string) {
+export function summaryText(report: Report, limits: Limits | null, metric: Metric, self: string, quota: Quota | null = null) {
   const tz = report.tzOffset
   const long = report.to - report.from > 20 * HOUR
   const total = valueOf(report.total, metric)
   const lines = [
     `**用量透视** ${clock(report.from, tz, long)} – ${clock(report.to, tz, long)} · 合计 ${usd(report.total.cost)} · ${tokens(report.total.tok)} tokens · ${group(report.total.req)} 次请求 · ${report.sessionCount} 个会话`,
   ]
-  for (const l of limits?.items ?? []) lines.push(`- ${limitLabel(l.kind)}已用 **${l.percentUsed}%**`)
+  for (const l of limits?.items ?? []) {
+    const rem = windowRemaining(quota, l)
+    lines.push(`- ${limitLabel(l.kind)}已用 **${l.percentUsed}%**${rem !== null ? `，约还能用 ${usd(rem)}（API 等价，按本机用量估算）` : ''}`)
+  }
   lines.push('', '| 占比 | 用量 | 会话 | 主 agent | 子 agent |', '|---:|---:|---|---|---|')
   for (const s of report.sessions.slice(0, 12)) {
     const v = valueOf(s.all, metric)
@@ -285,12 +328,14 @@ export const register: Register = on => {
     const usage = await $.session.usage()
     await saveLimits($, usage.rateLimits)
     $.clock.after(2e3, () => refreshBand($))
+    $.clock.after(4e3, () => refreshWeek($))
     return next(e)
   })
 
   on('session.measure', async ($, e, next) => {
     if (e.changed.includes('rateLimits')) await saveLimits($, e.rateLimits)
     $.clock.after(50, () => refreshBand($))
+    $.clock.after(100, () => refreshWeek($))
     return next(e)
   })
 
@@ -313,7 +358,7 @@ export const register: Register = on => {
     if (scan.error) return { text: `用量透视出错：${scan.error}` }
     if (isPlaced) return { text: '已打开用量透视面板。' }
     const report = await read($, reportAtom)
-    return { text: report ? summaryText(report, await read($, limitsAtom), await read($, metricAtom), await read($, selfAtom)) : '还没有数据。' }
+    return { text: report ? summaryText(report, await read($, limitsAtom), await read($, metricAtom), await read($, selfAtom), await read($, quotaAtom)) : '还没有数据。' }
   })
 
   on('ui.close', { id: PANE }, ($, e, next) => {
@@ -326,7 +371,7 @@ export const register: Register = on => {
   // points; a press opens the pane on the 5h window. The engine's own mode
   // labels (focus, memory paused) stay after it.
   on('ui.render', { component: 'SessionMode' }, async ($, e, next) => {
-    const { five, week, resetText, points } = await readUsage($)
+    const { five, week, resetText, points, left } = await readUsage($)
     if (!five && !week) return next(e)
     const { Box, Button, Text } = $.ui.resolve(e)
     const pct = (n: number) => (
@@ -343,6 +388,7 @@ export const register: Register = on => {
           {week ? <Text dimColor>{five ? ' · ' : ''}7d </Text> : ''}
           {week ? pct(week.percentUsed) : ''}
           {points !== undefined ? <Text dimColor> · 本会话≈{points.toFixed(1)}点</Text> : ''}
+          {left ? <Text dimColor> · 剩≈{usdShort(left.remaining)}（{left.limit.kind === 'five_hour' ? '5h' : '7d'}）</Text> : ''}
         </Button>
         {e.props.modes.length > 0 ? <Text dimColor> · {e.props.modes.join(' & ')}</Text> : null}
       </Box>
@@ -353,7 +399,7 @@ export const register: Register = on => {
   // (/usage-lens band on); off by default.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey || !(await read($, bandOnAtom))) return next(e)
-    const { five, week, resetText, points, share } = await readUsage($)
+    const { five, week, resetText, points, share, left } = await readUsage($)
     const ui = $.ui.resolve(e)
     const { Box, Button, Text } = ui
     const isWide = e.props.bodyColumns >= 64
@@ -379,6 +425,7 @@ export const register: Register = on => {
           {isWide && resetText ? <Text dimColor> · {resetText}</Text> : ''}
           {isWide && week ? <Text dimColor> · 7d {week.percentUsed}%</Text> : ''}
           {points !== undefined ? <Text dimColor> · 本会话≈{points.toFixed(1)}点{isWide ? `（${percent(share)}）` : ''}</Text> : ''}
+          {left ? <Text dimColor> · 剩≈{usdShort(left.remaining)}（{left.limit.kind === 'five_hour' ? '5h' : '7d'}）</Text> : ''}
           <Text color="suggestion"> ▸ 展开</Text>
         </Button>
       </Box>
@@ -396,6 +443,7 @@ export const register: Register = on => {
       report: await read($, reportAtom),
       limits: await read($, limitsAtom),
       scan: await read($, scanAtom),
+      quota: await read($, quotaAtom),
       expanded: await read($, expandedAtom),
       self: await read($, selfAtom),
       actions: {

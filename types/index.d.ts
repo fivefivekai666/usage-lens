@@ -41,6 +41,12 @@ export type Report = {
   note?: string
 }
 export type Scan = { isBusy: boolean; error?: string; at?: number }
+// The API-equivalent cost this machine recorded inside a window, kept so the dollars left
+// can follow the live percentage: `cost` belongs to the window that resets at `resetsAt`.
+export type QuotaWindow = { kind: string; resetsAt?: string; cost: number }
+// What the account itself reports in dollars (extra usage), when it has any.
+export type ExtraUsage = { limit: number; used: number; remaining: number }
+export type Quota = { at: number; windows: QuotaWindow[]; extra?: ExtraUsage }
 // What the band above the prompt shows of this session in the current 5h window.
 export type BandStat = { at: number; sessionCost: number; windowCost: number; percentUsed: number; tzOffset: number }
 
@@ -55,6 +61,7 @@ declare module 'claude-code' {
       expanded: string[]
       self: string
       band: BandStat | null
+      quota: Quota | null
       isBandOn: boolean
     }
   }

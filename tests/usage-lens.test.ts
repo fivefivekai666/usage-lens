@@ -1,5 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 
+import { remainingUsd, tightest, usdShort, windowRemaining } from '../hooks/format'
 import { bandStat, modelName, specFor, summaryText } from '../hooks/register'
 import type { Limits, Report } from '../types'
 
@@ -192,5 +193,61 @@ describe('band', () => {
     const ui = await $.ui.mount({ plugin: 'usage-lens', surface: 'desktop', ...BAND })
     expect((await ui.find({ key: 'usage-lens-band' }))?.text).toContain('▸ 展开')
     await ui.unmount()
+  })
+})
+
+describe('dollars left', () => {
+  const R1 = new Date(NOW + 3 * HOUR).toISOString()
+  const quota = { at: NOW, windows: [{ kind: 'seven_day', resetsAt: R1, cost: 300 }] }
+
+  test('what was spent over the percent used gives what the window still holds', async () => {
+    expect(remainingUsd(300, 75)).toBe(100) // $4 a point, 25 points left
+    expect(remainingUsd(50, 1)).toBeNull() // too little used to say
+    expect(remainingUsd(50, 100)).toBe(0)
+    expect(remainingUsd(0, 50)).toBeNull()
+    expect(usdShort(2940)).toBe('$2.9k')
+    expect(usdShort(42)).toBe('$42.0')
+  })
+
+  test('the estimate follows the live percentage, for the window its cost belongs to only', async () => {
+    expect(windowRemaining(quota, { kind: 'seven_day', percentUsed: 75, resetsAt: R1 })).toBe(100)
+    expect(windowRemaining(quota, { kind: 'seven_day', percentUsed: 80, resetsAt: R1 })).toBe(75)
+    expect(windowRemaining(quota, { kind: 'seven_day', percentUsed: 75, resetsAt: 'a newer window' })).toBeNull()
+    expect(windowRemaining(quota, { kind: 'five_hour', percentUsed: 75, resetsAt: R1 })).toBeNull()
+  })
+
+  test('the tightest window is the one with the fewest dollars left', async () => {
+    const both = { at: NOW, windows: [{ kind: 'seven_day', resetsAt: R1, cost: 300 }, { kind: 'five_hour', resetsAt: R1, cost: 10 }] }
+    const got = tightest(both, [
+      { kind: 'five_hour', percentUsed: 50, resetsAt: R1 }, // $10 left
+      { kind: 'seven_day', percentUsed: 75, resetsAt: R1 }, // $100 left
+    ])
+    expect(got?.limit.kind).toBe('five_hour')
+    expect(got?.remaining).toBe(10)
+    expect(tightest(null, [{ kind: 'seven_day', percentUsed: 75, resetsAt: R1 }])).toBeUndefined()
+  })
+
+  test('the footer says how many dollars the tightest window has left', async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    mock.store(on)
+    on('session.measure', ($, e) => ({ changed: e.changed }))
+    on('process.run', () => ({
+      value: { exitCode: 0, stdout: JSON.stringify(REPORT), stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+    }))
+    await $.session.measure({
+      context: { window: 1_000_000 },
+      rateLimits: [
+        { kind: 'five_hour', percentUsed: 12, resetsAt: new Date(NOW + 4 * HOUR).toISOString() },
+        { kind: 'seven_day', percentUsed: 87, resetsAt: new Date(NOW + 30 * HOUR).toISOString() },
+      ],
+      changed: ['rateLimits'],
+    })
+    await clock.advance(1000)
+    for (const surface of ['desktop', 'terminal'] as const) {
+      const ui = await $.ui.mount({ plugin: 'usage-lens', surface, component: 'SessionMode', props: { modes: [] } })
+      // the scan says $40 for both windows: $40 at 87% leaves about $6, $40 at 12% about $293
+      expect((await ui.find({ key: 'usage-lens-footer' }))?.text).toContain('剩≈$5.98（7d）')
+      await ui.unmount()
+    }
   })
 })

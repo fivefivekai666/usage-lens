@@ -1,9 +1,10 @@
 import type { Elements } from 'claude-code'
 
-import type { Limit, Limits, Metric, ModelUse, Range, RangeKind, Report, Scan, SessionUse } from '../types'
+import type { Limit, Limits, Metric, ModelUse, Quota, Range, RangeKind, Report, Scan, SessionUse } from '../types'
 import { COLORS, OTHER, meterColor, meterSvg, shareSvg, stackSvg, timelineSvg } from './charts'
 import {
   HOUR,
+  MIN_ESTIMATE_PCT,
   bar,
   clip,
   clock,
@@ -18,6 +19,7 @@ import {
   tokens,
   usd,
   valueOf,
+  windowRemaining,
 } from './format'
 
 export type Ui = Elements[keyof Elements]
@@ -43,6 +45,7 @@ export type PaneData = {
   report: Report | null
   limits: Limits | null
   scan: Scan
+  quota: Quota | null
   expanded: string[]
   self: string
   actions: {
@@ -61,7 +64,7 @@ const projectName = (s: SessionUse) => s.cwd || s.project
 // block characters where it does not.
 export function drawPane(ui: Ui, d: PaneData) {
   const { Box, Text, Button } = ui
-  const { report, limits, scan, range, metric, expanded, self, actions } = d
+  const { report, limits, scan, quota, range, metric, expanded, self, actions } = d
   const hasSvg = d.canSvg
   const textW = Math.max(12, Math.min(40, d.cols - 30))
 
@@ -80,7 +83,7 @@ export function drawPane(ui: Ui, d: PaneData) {
       </Box>
     ) : null
 
-  const meter = (key: string, label: string, pct: number, frac: number, color: string, foot: string) => {
+  const meter = (key: string, label: string, pct: number, frac: number, color: string, foot: string[]) => {
     const b = bar(frac, textW)
     return (
       <Box key={key} flexDirection="column">
@@ -98,7 +101,11 @@ export function drawPane(ui: Ui, d: PaneData) {
             <Text dimColor>{b.off}</Text>
           </Text>
         )}
-        {foot ? <Text dimColor>{foot}</Text> : null}
+        {foot.map((line, i) => (
+          <Text key={`${key}-foot${i}`} dimColor wrap="wrap">
+            {line}
+          </Text>
+        ))}
       </Box>
     )
   }
@@ -169,9 +176,15 @@ export function drawPane(ui: Ui, d: PaneData) {
       {limitRows.length > 0 ? (
         limitRows.map(l => {
           const resets = l.resetsAt ? Date.parse(l.resetsAt) : NaN
-          const foot = Number.isFinite(resets)
-            ? `${clock(resets, tz, l.kind !== 'five_hour')} 重置 · 还有 ${duration(resets - now)}`
-            : ''
+          const rem = windowRemaining(quota, l)
+          const foot = [
+            Number.isFinite(resets) ? `${clock(resets, tz, l.kind !== 'five_hour')} 重置 · 还有 ${duration(resets - now)}` : '',
+            rem !== null
+              ? `约还能用 ${usd(rem)}（API 等价；按本机已用 ${l.percentUsed}% 的花费估算，偏保守）`
+              : l.percentUsed < MIN_ESTIMATE_PCT
+                ? `已用不到 ${MIN_ESTIMATE_PCT}%，还估不出剩多少美元`
+                : '',
+          ].filter(Boolean)
           return meter(`limit-${l.kind}`, limitLabel(l.kind), l.percentUsed, l.percentUsed / 100, meterColor(l.percentUsed), foot)
         })
       ) : (
