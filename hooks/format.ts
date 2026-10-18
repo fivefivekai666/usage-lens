@@ -65,12 +65,21 @@ export function windowRemaining(quota: Quota | null, limit: Limit): number | nul
   return w ? remainingUsd(w.cost, limit.percentUsed) : null
 }
 
+// Dollars left in a window: the account's own figure when its plan has one, else the estimate.
+export type Left = { usd: number; isExact: boolean }
+export function windowLeft(quota: Quota | null, limit: Limit): Left | null {
+  const real = quota?.dollars?.[limit.kind]
+  if (real) return { usd: real.remaining, isExact: true }
+  const estimate = windowRemaining(quota, limit)
+  return estimate === null ? null : { usd: estimate, isExact: false }
+}
+
 // The window that runs out first: the one with the fewest dollars left.
-export function tightest(quota: Quota | null, limits: readonly Limit[]): { limit: Limit; remaining: number } | undefined {
-  let best: { limit: Limit; remaining: number } | undefined
+export function tightest(quota: Quota | null, limits: readonly Limit[]): { limit: Limit; remaining: number; isExact: boolean } | undefined {
+  let best: { limit: Limit; remaining: number; isExact: boolean } | undefined
   for (const limit of limits) {
-    const remaining = windowRemaining(quota, limit)
-    if (remaining !== null && (!best || remaining < best.remaining)) best = { limit, remaining }
+    const left = windowLeft(quota, limit)
+    if (left && (!best || left.usd < best.remaining)) best = { limit, remaining: left.usd, isExact: left.isExact }
   }
   return best
 }

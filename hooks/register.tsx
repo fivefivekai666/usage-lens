@@ -21,8 +21,9 @@ import {
   usd,
   usdShort,
   valueOf,
-  windowRemaining,
+  windowLeft,
 } from './format'
+import { USAGE_URL, parseAccountUsage } from './account'
 import { drawPane } from './pane'
 
 export { modelName, percent, tokens, usd } from './format'
@@ -43,6 +44,7 @@ const quotaAtom = atom({ plugin: 'usage-lens', key: 'quota' } as const, null)
 const bandOnAtom = atom({ plugin: 'usage-lens', key: 'isBandOn' } as const, false)
 const BAND_MIN_MS = 90e3
 const WEEK_MIN_MS = 10 * 60e3
+const ACCOUNT_MIN_MS = 5 * 60e3
 
 const ROLLING: Partial<Record<RangeKind, number>> = { '1h': HOUR, '5h': 5 * HOUR, '24h': DAY, '7d': 7 * DAY, '30d': 30 * DAY }
 const ARG_KINDS: Record<string, RangeKind> = {
@@ -195,6 +197,37 @@ async function putWindow($: EngineInterface, w: QuotaWindow, at: number) {
   )
 }
 
+let lastAccountAt = 0
+let isAccountBusy = false
+
+// What the account itself says in dollars, asked at most every five minutes. The
+// credential never reaches this module: `authorize` hands out a handle that only the
+// engine can turn into a header, and only for Anthropic's own host. A plan metered in
+// percent returns nulls, and a failed request leaves what was there.
+async function refreshAccount($: EngineInterface) {
+  const now = await $.clock.now()
+  if (isAccountBusy || now - lastAccountAt < ACCOUNT_MIN_MS) return
+  isAccountBusy = true
+  try {
+    lastAccountAt = now
+    const auth = await $.session.authorize()
+    if (!auth || auth.kind !== 'bearer') return
+    const res = await $.http.fetch(USAGE_URL, { auth: auth.handle, headers: { 'anthropic-beta': 'oauth-2025-04-20' } })
+    if (!res.ok) return
+    const { dollars, extra } = parseAccountUsage(JSON.parse(res.text))
+    await update($, quotaAtom, (q: Quota | null): Quota => {
+      const next: Quota = { ...(q ?? { windows: [] }), at: now, dollars }
+      if (extra) next.extra = extra
+      else delete next.extra
+      return next
+    })
+  } catch {
+    // the estimate stands
+  } finally {
+    isAccountBusy = false
+  }
+}
+
 let lastWeekAt = 0
 let isWeekBusy = false
 
@@ -272,8 +305,9 @@ async function readUsage($: EngineInterface) {
   const perPoint = band && band.percentUsed > 0 && band.windowCost > 0 ? band.windowCost / band.percentUsed : 0
   const points = band && perPoint > 0 ? band.sessionCost / perPoint : undefined
   const share = band && band.windowCost > 0 ? band.sessionCost / band.windowCost : 0
-  const left = tightest(await read($, quotaAtom), limits?.items.filter(l => l.kind === 'five_hour' || l.kind === 'seven_day') ?? [])
-  return { five, week, resetText, points, share, left }
+  const quota = await read($, quotaAtom)
+  const left = tightest(quota, limits?.items.filter(l => l.kind === 'five_hour' || l.kind === 'seven_day') ?? [])
+  return { five, week, resetText, points, share, left, extra: quota?.extra }
 }
 
 async function openFromBand($: EngineInterface) {
@@ -292,8 +326,12 @@ export function summaryText(report: Report, limits: Limits | null, metric: Metri
     `**用量透视** ${clock(report.from, tz, long)} – ${clock(report.to, tz, long)} · 合计 ${usd(report.total.cost)} · ${tokens(report.total.tok)} tokens · ${group(report.total.req)} 次请求 · ${report.sessionCount} 个会话`,
   ]
   for (const l of limits?.items ?? []) {
-    const rem = windowRemaining(quota, l)
-    lines.push(`- ${limitLabel(l.kind)}已用 **${l.percentUsed}%**${rem !== null ? `，约还能用 ${usd(rem)}（API 等价，按本机用量估算）` : ''}`)
+    const left = windowLeft(quota, l)
+    const tail = left ? (left.isExact ? `，还剩 ${usd(left.usd)}` : `，约还能用 ${usd(left.usd)}（API 等价，按本机用量估算）`) : ''
+    lines.push(`- ${limitLabel(l.kind)}已用 **${l.percentUsed}%**${tail}`)
+  }
+  if (quota?.extra) {
+    lines.push(`- 额外用量：已用 ${usd(quota.extra.used)} / ${usd(quota.extra.limit)}，还剩 **${usd(quota.extra.remaining)}**`)
   }
   lines.push('', '| 占比 | 用量 | 会话 | 主 agent | 子 agent |', '|---:|---:|---|---|---|')
   for (const s of report.sessions.slice(0, 12)) {
@@ -329,6 +367,7 @@ export const register: Register = on => {
     await saveLimits($, usage.rateLimits)
     $.clock.after(2e3, () => refreshBand($))
     $.clock.after(4e3, () => refreshWeek($))
+    $.clock.after(6e3, () => refreshAccount($))
     return next(e)
   })
 
@@ -336,6 +375,7 @@ export const register: Register = on => {
     if (e.changed.includes('rateLimits')) await saveLimits($, e.rateLimits)
     $.clock.after(50, () => refreshBand($))
     $.clock.after(100, () => refreshWeek($))
+    $.clock.after(150, () => refreshAccount($))
     return next(e)
   })
 
@@ -371,7 +411,7 @@ export const register: Register = on => {
   // points; a press opens the pane on the 5h window. The engine's own mode
   // labels (focus, memory paused) stay after it.
   on('ui.render', { component: 'SessionMode' }, async ($, e, next) => {
-    const { five, week, resetText, points, left } = await readUsage($)
+    const { five, week, resetText, points, left, extra } = await readUsage($)
     if (!five && !week) return next(e)
     const { Box, Button, Text } = $.ui.resolve(e)
     const pct = (n: number) => (
@@ -388,7 +428,8 @@ export const register: Register = on => {
           {week ? <Text dimColor>{five ? ' · ' : ''}7d </Text> : ''}
           {week ? pct(week.percentUsed) : ''}
           {points !== undefined ? <Text dimColor> · 本会话≈{points.toFixed(1)}点</Text> : ''}
-          {left ? <Text dimColor> · 剩≈{usdShort(left.remaining)}（{left.limit.kind === 'five_hour' ? '5h' : '7d'}）</Text> : ''}
+          {left ? <Text dimColor> · 剩{left.isExact ? '' : '≈'}{usdShort(left.remaining)}（{left.limit.kind === 'five_hour' ? '5h' : '7d'}）</Text> : ''}
+          {extra ? <Text dimColor> · 额外剩{usdShort(extra.remaining)}</Text> : ''}
         </Button>
         {e.props.modes.length > 0 ? <Text dimColor> · {e.props.modes.join(' & ')}</Text> : null}
       </Box>
@@ -399,7 +440,7 @@ export const register: Register = on => {
   // (/usage-lens band on); off by default.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey || !(await read($, bandOnAtom))) return next(e)
-    const { five, week, resetText, points, share, left } = await readUsage($)
+    const { five, week, resetText, points, share, left, extra } = await readUsage($)
     const ui = $.ui.resolve(e)
     const { Box, Button, Text } = ui
     const isWide = e.props.bodyColumns >= 64
@@ -425,7 +466,8 @@ export const register: Register = on => {
           {isWide && resetText ? <Text dimColor> · {resetText}</Text> : ''}
           {isWide && week ? <Text dimColor> · 7d {week.percentUsed}%</Text> : ''}
           {points !== undefined ? <Text dimColor> · 本会话≈{points.toFixed(1)}点{isWide ? `（${percent(share)}）` : ''}</Text> : ''}
-          {left ? <Text dimColor> · 剩≈{usdShort(left.remaining)}（{left.limit.kind === 'five_hour' ? '5h' : '7d'}）</Text> : ''}
+          {left ? <Text dimColor> · 剩{left.isExact ? '' : '≈'}{usdShort(left.remaining)}（{left.limit.kind === 'five_hour' ? '5h' : '7d'}）</Text> : ''}
+          {extra ? <Text dimColor> · 额外剩{usdShort(extra.remaining)}</Text> : ''}
           <Text color="suggestion"> ▸ 展开</Text>
         </Button>
       </Box>

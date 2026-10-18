@@ -19,7 +19,7 @@ import {
   tokens,
   usd,
   valueOf,
-  windowRemaining,
+  windowLeft,
 } from './format'
 
 export type Ui = Elements[keyof Elements]
@@ -176,17 +176,34 @@ export function drawPane(ui: Ui, d: PaneData) {
       {limitRows.length > 0 ? (
         limitRows.map(l => {
           const resets = l.resetsAt ? Date.parse(l.resetsAt) : NaN
-          const rem = windowRemaining(quota, l)
+          const left = windowLeft(quota, l)
+          const exact = quota?.dollars?.[l.kind]
           const foot = [
             Number.isFinite(resets) ? `${clock(resets, tz, l.kind !== 'five_hour')} 重置 · 还有 ${duration(resets - now)}` : '',
-            rem !== null
-              ? `约还能用 ${usd(rem)}（API 等价；按本机已用 ${l.percentUsed}% 的花费估算，偏保守）`
-              : l.percentUsed < MIN_ESTIMATE_PCT
-                ? `已用不到 ${MIN_ESTIMATE_PCT}%，还估不出剩多少美元`
-                : '',
+            exact
+              ? `额度 ${usd(exact.limit)}，已用 ${usd(exact.used)}，还剩 ${usd(exact.remaining)}`
+              : left
+                ? `约还能用 ${usd(left.usd)}（API 等价；按本机已用 ${l.percentUsed}% 的花费估算，偏保守）`
+                : l.percentUsed < MIN_ESTIMATE_PCT
+                  ? `已用不到 ${MIN_ESTIMATE_PCT}%，还估不出剩多少美元`
+                  : '',
           ].filter(Boolean)
           return meter(`limit-${l.kind}`, limitLabel(l.kind), l.percentUsed, l.percentUsed / 100, meterColor(l.percentUsed), foot)
         })
+          .concat(
+            quota?.extra
+              ? [
+                  meter(
+                    'limit-extra',
+                    '额外用量',
+                    Math.round((quota.extra.used / Math.max(quota.extra.limit, 0.01)) * 100),
+                    quota.extra.used / Math.max(quota.extra.limit, 0.01),
+                    meterColor((quota.extra.used / Math.max(quota.extra.limit, 0.01)) * 100),
+                    [`已用 ${usd(quota.extra.used)} / ${usd(quota.extra.limit)}，还剩 ${usd(quota.extra.remaining)}`],
+                  ),
+                ]
+              : [],
+          )
       ) : (
         <Text dimColor>还没有 5h / 7d 限额读数：本会话发出第一个 API 请求后才有；用 API key 登录的话没有这类限额。</Text>
       )}

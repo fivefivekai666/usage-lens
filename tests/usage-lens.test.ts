@@ -1,5 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 
+import { money, parseAccountUsage } from '../hooks/account'
 import { remainingUsd, tightest, usdShort, windowRemaining } from '../hooks/format'
 import { bandStat, modelName, specFor, summaryText } from '../hooks/register'
 import type { Limits, Report } from '../types'
@@ -247,6 +248,79 @@ describe('dollars left', () => {
       const ui = await $.ui.mount({ plugin: 'usage-lens', surface, component: 'SessionMode', props: { modes: [] } })
       // the scan says $40 for both windows: $40 at 87% leaves about $6, $40 at 12% about $293
       expect((await ui.find({ key: 'usage-lens-footer' }))?.text).toContain('剩≈$5.98（7d）')
+      await ui.unmount()
+    }
+  })
+})
+
+describe('the account in dollars', () => {
+  // what a percent-metered plan returned, trimmed to the fields read
+  const PERCENT_PLAN = {
+    five_hour: { utilization: 2, limit_dollars: null, used_dollars: null, remaining_dollars: null },
+    seven_day: { utilization: 75, limit_dollars: null, used_dollars: null, remaining_dollars: null },
+    spend: { used: { amount_minor: 0, currency: 'USD', exponent: 2 }, limit: null, enabled: false },
+  }
+
+  test('a percent-metered plan gives no dollars', async () => {
+    expect(parseAccountUsage(PERCENT_PLAN)).toEqual({ dollars: {} })
+    expect(parseAccountUsage(null)).toEqual({ dollars: {} })
+    expect(parseAccountUsage('not an object')).toEqual({ dollars: {} })
+  })
+
+  test('a dollar-metered window and enabled extra usage are read', async () => {
+    const got = parseAccountUsage({
+      five_hour: { limit_dollars: 50, used_dollars: 12.5, remaining_dollars: 37.5 },
+      seven_day: { limit_dollars: 400, used_dollars: 100 },
+      spend: { enabled: true, used: { amount_minor: 1250, exponent: 2 }, limit: { amount_minor: 5000, exponent: 2 } },
+    })
+    expect(got.dollars.five_hour).toEqual({ limit: 50, used: 12.5, remaining: 37.5 })
+    expect(got.dollars.seven_day?.remaining).toBe(300) // worked out when the account does not say
+    expect(got.extra).toEqual({ limit: 50, used: 12.5, remaining: 37.5 })
+    expect(money({ amount_minor: 1250, exponent: 2 })).toBe(12.5)
+    expect(money({ amount_minor: '1250' })).toBeUndefined()
+  })
+
+  test("the account's own figure beats the estimate, and is not marked approximate", async () => {
+    const R = new Date(NOW + 3 * HOUR).toISOString()
+    const quota = {
+      at: NOW,
+      windows: [{ kind: 'seven_day', resetsAt: R, cost: 300 }],
+      dollars: { seven_day: { limit: 400, used: 100, remaining: 300 } },
+    }
+    const got = tightest(quota, [{ kind: 'seven_day', percentUsed: 75, resetsAt: R }])
+    expect(got).toMatchObject({ remaining: 300, isExact: true }) // the estimate would have said $100
+  })
+
+  test('the footer says so for an account that reports dollars, extra usage included', async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    mock.store(on)
+    on('session.measure', ($, e) => ({ changed: e.changed }))
+    on('process.run', () => ({
+      value: { exitCode: 0, stdout: JSON.stringify(REPORT), stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+    }))
+    on('session.authorize', () => ({ value: { handle: 'h', kind: 'bearer' } }))
+    on('http.fetch', () => ({
+      value: {
+        status: 200,
+        ok: true,
+        headers: {},
+        text: JSON.stringify({
+          seven_day: { limit_dollars: 400, used_dollars: 100, remaining_dollars: 300 },
+          spend: { enabled: true, used: { amount_minor: 1250, exponent: 2 }, limit: { amount_minor: 5000, exponent: 2 } },
+        }),
+      },
+    }))
+    await $.session.measure({
+      context: { window: 1_000_000 },
+      rateLimits: [{ kind: 'seven_day', percentUsed: 25, resetsAt: new Date(NOW + 30 * HOUR).toISOString() }],
+      changed: ['rateLimits'],
+    })
+    await clock.advance(1000)
+    for (const surface of ['desktop', 'terminal'] as const) {
+      const ui = await $.ui.mount({ plugin: 'usage-lens', surface, component: 'SessionMode', props: { modes: [] } })
+      const text = (await ui.find({ key: 'usage-lens-footer' }))?.text ?? ''
+      expect(text).toContain('剩$300（7d）')
+      expect(text).toContain('额外剩$37.5')
       await ui.unmount()
     }
   })

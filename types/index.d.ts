@@ -46,7 +46,9 @@ export type Scan = { isBusy: boolean; error?: string; at?: number }
 export type QuotaWindow = { kind: string; resetsAt?: string; cost: number }
 // What the account itself reports in dollars (extra usage), when it has any.
 export type ExtraUsage = { limit: number; used: number; remaining: number }
-export type Quota = { at: number; windows: QuotaWindow[]; extra?: ExtraUsage }
+// `dollars` is what the account reports per window when its plan is metered in dollars.
+export type WindowDollars = { limit: number; used: number; remaining: number }
+export type Quota = { at: number; windows: QuotaWindow[]; extra?: ExtraUsage; dollars?: Record<string, WindowDollars> }
 // What the band above the prompt shows of this session in the current 5h window.
 export type BandStat = { at: number; sessionCost: number; windowCost: number; percentUsed: number; tzOffset: number }
 
