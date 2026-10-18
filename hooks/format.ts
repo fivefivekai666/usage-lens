@@ -1,4 +1,4 @@
-import type { Limit, Metric, Quota, Use } from '../types'
+import type { Limit, Metric, Quota, Sample, Use } from '../types'
 
 export const HOUR = 3600e3
 export const DAY = 24 * HOUR
@@ -83,3 +83,41 @@ export function tightest(quota: Quota | null, limits: readonly Limit[]): { limit
   }
   return best
 }
+
+// ---------------------------------------------------------------- does a percent cost what we think?
+
+// The latest stretch is judged over at least this many points of the account's percentage:
+// a single point is mostly rounding.
+export const RECENT_PTS = 5
+
+export type Calibration = {
+  overall: number | null // dollars per 1% since the window began
+  recent: number | null // dollars per 1% over the latest stretch
+  points: number // how many percentage points that stretch covers
+  drift: number | null // recent / overall - 1
+}
+
+// From the readings of one window (`kind` and `resetsAt` name it): the cumulative dollars per
+// percent, and what the latest stretch of at least RECENT_PTS points really cost per percent.
+// If the two differ a lot, spend is not in proportion to the percentage and the estimate is off.
+export function calibrate(samples: readonly Sample[], kind: string, resetsAt: string | undefined): Calibration {
+  const mine = samples.filter(s => s.kind === kind && s.resetsAt === resetsAt).sort((a, b) => a.at - b.at)
+  const last = mine[mine.length - 1]
+  const none: Calibration = { overall: null, recent: null, points: 0, drift: null }
+  if (!last) return none
+  const overall = last.pct >= MIN_ESTIMATE_PCT && last.cost > 0 ? last.cost / last.pct : null
+  let from: Sample | undefined
+  for (let i = mine.length - 2; i >= 0; i--) {
+    const s = mine[i]
+    if (s && last.pct - s.pct >= RECENT_PTS) {
+      from = s
+      break
+    }
+  }
+  const dPct = from ? last.pct - from.pct : 0
+  const dCost = from ? last.cost - from.cost : 0
+  const recent = from && dPct > 0 && dCost > 0 ? dCost / dPct : null
+  return { overall, recent, points: dPct, drift: overall && recent ? recent / overall - 1 : null }
+}
+
+export const signedPercent = (x: number) => `${x >= 0 ? '+' : '−'}${Math.round(Math.abs(x) * 100)}%`

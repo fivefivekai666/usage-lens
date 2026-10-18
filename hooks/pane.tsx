@@ -1,11 +1,13 @@
 import type { Elements } from 'claude-code'
 
-import type { Limit, Limits, Metric, ModelUse, Quota, Range, RangeKind, Report, Scan, SessionUse } from '../types'
+import type { Limit, Limits, Metric, ModelUse, Quota, Range, RangeKind, Report, Sample, Scan, SessionUse } from '../types'
 import { COLORS, OTHER, meterColor, meterSvg, shareSvg, stackSvg, timelineSvg } from './charts'
 import {
   HOUR,
   MIN_ESTIMATE_PCT,
+  RECENT_PTS,
   bar,
+  calibrate,
   clip,
   clock,
   duration,
@@ -16,6 +18,7 @@ import {
   percent,
   severity,
   showValue,
+  signedPercent,
   tokens,
   usd,
   valueOf,
@@ -46,6 +49,7 @@ export type PaneData = {
   limits: Limits | null
   scan: Scan
   quota: Quota | null
+  calib: Sample[]
   expanded: string[]
   self: string
   actions: {
@@ -64,7 +68,7 @@ const projectName = (s: SessionUse) => s.cwd || s.project
 // block characters where it does not.
 export function drawPane(ui: Ui, d: PaneData) {
   const { Box, Text, Button } = ui
-  const { report, limits, scan, quota, range, metric, expanded, self, actions } = d
+  const { report, limits, scan, quota, calib, range, metric, expanded, self, actions } = d
   const hasSvg = d.canSvg
   const textW = Math.max(12, Math.min(40, d.cols - 30))
 
@@ -168,6 +172,22 @@ export function drawPane(ui: Ui, d: PaneData) {
 
   // ---------------------------------------------------------------- the account's windows
 
+  // Does a percent cost what the estimate assumes? Compares the dollars per percent since the
+  // window began with what the latest stretch cost, from the readings kept.
+  const calibration = (l: Limit): string[] => {
+    const c = calibrate(calib, l.kind, l.resetsAt)
+    if (c.overall === null) return []
+    if (c.recent === null || c.drift === null) {
+      return [`校准：累计每 1% ≈ ${usd(c.overall)}；最近涨的还不到 ${RECENT_PTS} 个百分点，看不出速率有没有变`]
+    }
+    const verdict = Math.abs(c.drift) > 0.25 ? `，差得多，上面的估算可能${c.drift > 0 ? '偏多' : '偏少'}` : '，和累计比例基本一致'
+    const byRecent = c.recent * (100 - l.percentUsed)
+    return [
+      `校准：累计每 1% ≈ ${usd(c.overall)}；最近 ${Math.round(c.points)} 个百分点实际每 1% ≈ ${usd(c.recent)}（${signedPercent(c.drift)}）${verdict}`,
+      ...(Math.abs(c.drift) > 0.25 ? [`按最近的速率算，约还能用 ${usd(byRecent)}`] : []),
+    ]
+  }
+
   const limitRows = (limits?.items ?? []).filter((l: Limit) => l.kind === 'five_hour' || l.kind === 'seven_day')
   const now = report?.now ?? limits?.at ?? 0
   const tz = report?.tzOffset ?? 0
@@ -187,6 +207,7 @@ export function drawPane(ui: Ui, d: PaneData) {
                 : l.percentUsed < MIN_ESTIMATE_PCT
                   ? `已用不到 ${MIN_ESTIMATE_PCT}%，还估不出剩多少美元`
                   : '',
+            ...(exact || !left ? [] : calibration(l)),
           ].filter(Boolean)
           return meter(`limit-${l.kind}`, limitLabel(l.kind), l.percentUsed, l.percentUsed / 100, meterColor(l.percentUsed), foot)
         })

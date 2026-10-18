@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionRateLimit } from 'claude-code'
 
-import type { BandStat, Limit, Limits, Metric, Quota, QuotaWindow, Range, RangeKind, Report, SessionUse } from '../types'
+import type { BandStat, Limit, Limits, Metric, Quota, QuotaWindow, Range, RangeKind, Report, Sample, SessionUse } from '../types'
 import { COLORS, meterColor, meterSvg } from './charts'
 import {
   DAY,
@@ -41,6 +41,7 @@ const expandedAtom = atom({ plugin: 'usage-lens', key: 'expanded' } as const, []
 const selfAtom = atom({ plugin: 'usage-lens', key: 'self' } as const, '')
 const bandAtom = atom({ plugin: 'usage-lens', key: 'band' } as const, null)
 const quotaAtom = atom({ plugin: 'usage-lens', key: 'quota' } as const, null)
+const calibAtom = atom({ plugin: 'usage-lens', key: 'calib' } as const, [])
 const bandOnAtom = atom({ plugin: 'usage-lens', key: 'isBandOn' } as const, false)
 const BAND_MIN_MS = 90e3
 const WEEK_MIN_MS = 10 * 60e3
@@ -195,6 +196,24 @@ async function putWindow($: EngineInterface, w: QuotaWindow, at: number) {
     quotaAtom,
     (q: Quota | null): Quota => ({ ...(q ?? { windows: [] }), at, windows: [...(q?.windows ?? []).filter(x => x.kind !== w.kind), w] }),
   )
+  await recordSample($, w, at)
+}
+
+const MAX_SAMPLES = 400
+
+// A reading is kept when the account's percentage has moved since the last one of that window:
+// the percent as the account says it now, with what this machine has spent in the window.
+async function recordSample($: EngineInterface, w: QuotaWindow, at: number) {
+  if (!w.resetsAt) return
+  const limit = (await read($, limitsAtom))?.items.find(l => l.kind === w.kind && l.resetsAt === w.resetsAt)
+  if (!limit) return
+  const all = await read($, calibAtom)
+  const last = all.filter(s => s.kind === w.kind && s.resetsAt === w.resetsAt).pop()
+  if (last && last.pct === limit.percentUsed) return
+  const sample: Sample = { at, kind: w.kind, resetsAt: w.resetsAt, pct: limit.percentUsed, cost: w.cost }
+  const kept = all.filter(s => Date.parse(s.resetsAt) > at - DAY).concat(sample).slice(-MAX_SAMPLES)
+  await update($, calibAtom, () => kept)
+  await $.store.set('calib', kept)
 }
 
 let lastAccountAt = 0
@@ -361,6 +380,8 @@ export const register: Register = on => {
     const isBandOn = (await $.store.get('bandOn')) === true
     await update($, bandOnAtom, () => isBandOn)
     $.ui.status(undefined)
+    const savedCalib = await $.store.get('calib')
+    if (Array.isArray(savedCalib)) await update($, calibAtom, () => savedCalib as Sample[])
     const stored = (await $.store.get('limits')) as Limits | undefined
     if (stored?.items) await update($, limitsAtom, held => (held && held.at > stored.at ? held : stored))
     const usage = await $.session.usage()
@@ -486,6 +507,7 @@ export const register: Register = on => {
       limits: await read($, limitsAtom),
       scan: await read($, scanAtom),
       quota: await read($, quotaAtom),
+      calib: await read($, calibAtom),
       expanded: await read($, expandedAtom),
       self: await read($, selfAtom),
       actions: {

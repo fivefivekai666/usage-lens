@@ -49,6 +49,9 @@ export type ExtraUsage = { limit: number; used: number; remaining: number }
 // `dollars` is what the account reports per window when its plan is metered in dollars.
 export type WindowDollars = { limit: number; used: number; remaining: number }
 export type Quota = { at: number; windows: QuotaWindow[]; extra?: ExtraUsage; dollars?: Record<string, WindowDollars> }
+// One reading of a window: the percent the account said, and what this machine had spent in
+// that window by then. Kept (across sessions) to see how many dollars a percent really costs.
+export type Sample = { at: number; kind: string; resetsAt: string; pct: number; cost: number }
 // What the band above the prompt shows of this session in the current 5h window.
 export type BandStat = { at: number; sessionCost: number; windowCost: number; percentUsed: number; tzOffset: number }
 
@@ -64,6 +67,7 @@ declare module 'claude-code' {
       self: string
       band: BandStat | null
       quota: Quota | null
+      calib: Sample[]
       isBandOn: boolean
     }
   }

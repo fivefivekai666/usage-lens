@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 
 import { money, parseAccountUsage } from '../hooks/account'
-import { remainingUsd, tightest, usdShort, windowRemaining } from '../hooks/format'
+import { calibrate, remainingUsd, signedPercent, tightest, usdShort, windowRemaining } from '../hooks/format'
 import { bandStat, modelName, specFor, summaryText } from '../hooks/register'
 import type { Limits, Report } from '../types'
 
@@ -321,6 +321,65 @@ describe('the account in dollars', () => {
       const text = (await ui.find({ key: 'usage-lens-footer' }))?.text ?? ''
       expect(text).toContain('剩$300（7d）')
       expect(text).toContain('额外剩$37.5')
+      await ui.unmount()
+    }
+  })
+})
+
+describe('does a percent cost what we think', () => {
+  const R = 'window-1'
+  const round3 = (x: number | null) => (x === null ? null : Math.round(x * 1000) / 1000)
+  const at = (min: number, pct: number, cost: number, resetsAt = R) => ({ at: NOW + min * 60e3, kind: 'seven_day', resetsAt, pct, cost })
+
+  test('cumulative dollars per percent, and what the latest stretch cost', async () => {
+    const got = calibrate([at(0, 60, 1440), at(30, 70, 1680), at(60, 75, 1801)], 'seven_day', R)
+    expect(round3(got.overall)).toBe(round3(1801 / 75))
+    expect(got.points).toBe(5) // 70 -> 75 is the latest stretch of at least five points
+    expect(round3(got.recent)).toBe(round3(121 / 5))
+    expect(round3(got.drift)).toBe(round3(121 / 5 / (1801 / 75) - 1))
+    expect(signedPercent(got.drift ?? 0)).toBe('+1%')
+  })
+
+  test('too short a stretch says nothing about the rate; another window is not mixed in', async () => {
+    const got = calibrate([at(0, 72, 1728), at(10, 75, 1801), at(5, 10, 100, 'window-0')], 'seven_day', R)
+    expect(round3(got.overall)).toBe(round3(1801 / 75))
+    expect(got.recent).toBeNull()
+    expect(got.drift).toBeNull()
+    expect(calibrate([], 'seven_day', R)).toEqual({ overall: null, recent: null, points: 0, drift: null })
+    expect(calibrate([at(0, 1, 5)], 'seven_day', R).overall).toBeNull() // under 3% used
+  })
+
+  test('the pane says when the latest stretch cost far more per percent than the total suggests', async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    mock.store(on)
+    let cost = 1000
+    on('session.measure', ($, e) => ({ changed: e.changed }))
+    on('process.run', () => ({
+      value: {
+        exitCode: 0,
+        stdout: JSON.stringify({ ...REPORT, total: { ...REPORT.total, cost } }),
+        stderr: '',
+        isStdoutTruncated: false,
+        isStderrTruncated: false,
+      },
+    }))
+    const resetsAt = new Date(NOW + 30 * HOUR).toISOString()
+    const measure = (pct: number) =>
+      $.session.measure({ context: { window: 1_000_000 }, rateLimits: [{ kind: 'seven_day', percentUsed: pct, resetsAt }], changed: ['rateLimits'] })
+    await measure(70)
+    await clock.advance(1000) // the week is scanned: $1000 at 70%
+    cost = 1801
+    await clock.advance(11 * 60e3) // the week is only rescanned every ten minutes
+    await measure(75)
+    await clock.advance(1000) // $1801 at 75%: the last five points cost $160 each, the total says $24
+    const props = { title: '用量透视', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} } as const
+    for (const surface of ['desktop', 'terminal'] as const) {
+      const ui = await $.ui.mount({ plugin: 'usage-lens', surface, component: 'Pane', requestId: 'usage-lens', props })
+      const text = (await ui.findAll({ type: 'Text', text: /校准/ })).map(x => x.text).join('\n')
+      expect(text).toContain('累计每 1% ≈ $24.0')
+      expect(text).toContain('最近 5 个百分点实际每 1% ≈ $160')
+      expect(text).toContain('估算可能偏多')
+      expect(await ui.find({ type: 'Text', text: /按最近的速率算，约还能用 \$4,005/ })).toBeDefined()
       await ui.unmount()
     }
   })
