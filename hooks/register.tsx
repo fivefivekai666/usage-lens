@@ -9,7 +9,7 @@ import {
   bar,
   clip,
   clock,
-  duration,
+  shortSpan,
   group,
   limitLabel,
   modelName,
@@ -315,22 +315,19 @@ async function refreshBand($: EngineInterface) {
 async function readUsage($: EngineInterface) {
   const limits = await read($, limitsAtom)
   const band = await read($, bandAtom)
-  const five = limits?.items.find(l => l.kind === 'five_hour')
-  const week = limits?.items.find(l => l.kind === 'seven_day')
-  const resets = five?.resetsAt ? Date.parse(five.resetsAt) : NaN
-  const resetText = !Number.isFinite(resets)
-    ? ''
-    : band
-      ? `${clock(resets, band.tzOffset, false)}重置`
-      : `${duration(resets - (await $.clock.now()))}后重置`
+  const quota = await read($, quotaAtom)
+  const calib = await read($, calibAtom)
+  const now = await $.clock.now()
+  const windows = (limits?.items ?? []).filter(l => l.kind === 'five_hour' || l.kind === 'seven_day')
+  const five = windows.find(l => l.kind === 'five_hour')
+  const week = windows.find(l => l.kind === 'seven_day')
+  // how long until a window resets, as "2.7h"
+  const toReset = (l: Limit | undefined) => (l?.resetsAt && Date.parse(l.resetsAt) > now ? shortSpan(Date.parse(l.resetsAt) - now) : '')
   const perPoint = band && band.percentUsed > 0 && band.windowCost > 0 ? band.windowCost / band.percentUsed : 0
   const points = band && perPoint > 0 ? band.sessionCost / perPoint : undefined
   const share = band && band.windowCost > 0 ? band.sessionCost / band.windowCost : 0
-  const quota = await read($, quotaAtom)
-  const left = tightest(quota, limits?.items.filter(l => l.kind === 'five_hour' || l.kind === 'seven_day') ?? [])
-  const now = await $.clock.now()
-  const calib = await read($, calibAtom)
-  const soonest = firstToRunOut((limits?.items ?? []).filter(l => l.kind === 'five_hour' || l.kind === 'seven_day').map(l => etaOf(calib, l, now)))
+  const left = tightest(quota, windows, calib)
+  const soonest = firstToRunOut(windows.map(l => etaOf(calib, l, now)))
   const runsOut = soonest
     ? {
         label: soonest.kind === 'five_hour' ? '5h' : '7d',
@@ -338,7 +335,7 @@ async function readUsage($: EngineInterface) {
         isSoon: soonest.runsOutAt - now < 2 * HOUR,
       }
     : undefined
-  return { five, week, resetText, points, share, left, extra: quota?.extra, runsOut }
+  return { five, week, fiveIn: toReset(five), weekIn: toReset(week), points, share, left, extra: quota?.extra, runsOut }
 }
 
 async function openFromBand($: EngineInterface) {
@@ -444,7 +441,7 @@ export const register: Register = on => {
   // points; a press opens the pane on the 5h window. The engine's own mode
   // labels (focus, memory paused) stay after it.
   on('ui.render', { component: 'SessionMode' }, async ($, e, next) => {
-    const { five, week, resetText, points, left, extra, runsOut } = await readUsage($)
+    const { five, week, fiveIn, weekIn, points, left, extra, runsOut } = await readUsage($)
     if (!five && !week) return next(e)
     const { Box, Button, Text } = $.ui.resolve(e)
     const pct = (n: number) => (
@@ -457,13 +454,14 @@ export const register: Register = on => {
         <Button key="usage-lens-footer" plain onPress={() => openFromBand($)}>
           {five ? <Text dimColor>5h </Text> : ''}
           {five ? pct(five.percentUsed) : ''}
-          {five && resetText ? <Text dimColor> {resetText}</Text> : ''}
+          {five && fiveIn ? <Text dimColor>（{fiveIn}）</Text> : ''}
           {week ? <Text dimColor>{five ? ' · ' : ''}7d </Text> : ''}
           {week ? pct(week.percentUsed) : ''}
-          {points !== undefined ? <Text dimColor> · 本会话≈{points.toFixed(1)}点</Text> : ''}
-          {left ? <Text dimColor> · 剩{left.isExact ? '' : '≈'}{usdShort(left.remaining)}（{left.limit.kind === 'five_hour' ? '5h' : '7d'}）</Text> : ''}
+          {week && weekIn ? <Text dimColor>（{weekIn}）</Text> : ''}
+          {points !== undefined && points >= 0.05 ? <Text dimColor> · 本会话{points.toFixed(1)}点</Text> : ''}
+          {left ? <Text dimColor> · 剩{left.isExact ? '' : '≈'}{usdShort(left.remaining)}</Text> : ''}
           {extra ? <Text dimColor> · 额外剩{usdShort(extra.remaining)}</Text> : ''}
-          {runsOut ? <Text color={runsOut.isSoon ? 'error' : 'warning'}> · 预计{runsOut.text}用完（{runsOut.label}）</Text> : ''}
+          {runsOut ? <Text color={runsOut.isSoon ? 'error' : 'warning'}> · ≈{runsOut.text} 用完（{runsOut.label}）</Text> : ''}
         </Button>
         {e.props.modes.length > 0 ? <Text dimColor> · {e.props.modes.join(' & ')}</Text> : null}
       </Box>
@@ -474,7 +472,7 @@ export const register: Register = on => {
   // (/usage-lens band on); off by default.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey || !(await read($, bandOnAtom))) return next(e)
-    const { five, week, resetText, points, share, left, extra, runsOut } = await readUsage($)
+    const { five, week, fiveIn, points, share, left, extra, runsOut } = await readUsage($)
     const ui = $.ui.resolve(e)
     const { Box, Button, Text } = ui
     const isWide = e.props.bodyColumns >= 64
@@ -497,13 +495,13 @@ export const register: Register = on => {
         )}
         <Button key="usage-lens-band" plain onPress={() => openFromBand($)}>
           {five ? <Text bold color={severity(pct)}>{pct}%</Text> : <Text dimColor>还没有读数</Text>}
-          {isWide && resetText ? <Text dimColor> · {resetText}</Text> : ''}
+          {isWide && fiveIn ? <Text dimColor>（{fiveIn}）</Text> : ''}
           {isWide && week ? <Text dimColor> · 7d {week.percentUsed}%</Text> : ''}
-          {points !== undefined ? <Text dimColor> · 本会话≈{points.toFixed(1)}点{isWide ? `（${percent(share)}）` : ''}</Text> : ''}
-          {left ? <Text dimColor> · 剩{left.isExact ? '' : '≈'}{usdShort(left.remaining)}（{left.limit.kind === 'five_hour' ? '5h' : '7d'}）</Text> : ''}
+          {points !== undefined && points >= 0.05 ? <Text dimColor> · 本会话{points.toFixed(1)}点{isWide ? `（${percent(share)}）` : ''}</Text> : ''}
+          {left ? <Text dimColor> · 剩{left.isExact ? '' : '≈'}{usdShort(left.remaining)}</Text> : ''}
           {extra ? <Text dimColor> · 额外剩{usdShort(extra.remaining)}</Text> : ''}
-          {runsOut ? <Text color={runsOut.isSoon ? 'error' : 'warning'}> · 预计{runsOut.text}用完（{runsOut.label}）</Text> : ''}
-          <Text color="suggestion"> ▸ 展开</Text>
+          {runsOut ? <Text color={runsOut.isSoon ? 'error' : 'warning'}> · ≈{runsOut.text} 用完（{runsOut.label}）</Text> : ''}
+          <Text color="suggestion"> ▸</Text>
         </Button>
       </Box>
     )

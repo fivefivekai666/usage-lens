@@ -122,12 +122,12 @@ describe('pane', () => {
     for (const surface of ['desktop', 'terminal'] as const) {
       const ui = await $.ui.mount({ plugin: 'usage-lens', surface, ...PANE })
       await ui.press({ key: 'refresh' })
-      expect(await ui.find({ text: /会话占比/ })).toBeDefined()
+      expect(await ui.find({ text: /点一行展开/ })).toBeDefined()
       expect((await ui.find({ key: 'row-s-big' }))?.text).toContain('重构支付模块')
       expect(await ui.find({ key: 'pc-s-big', text: '75.0%' })).toBeDefined()
-      expect(await ui.find({ text: /用量最高的子 agent/ })).toBeUndefined()
+      expect(await ui.find({ text: /最贵的子 agent/ })).toBeUndefined()
       await ui.press({ key: 'row-s-big' })
-      expect(await ui.find({ text: /用量最高的子 agent/ })).toBeDefined()
+      expect(await ui.find({ text: /最贵的子 agent/ })).toBeDefined()
       expect(await ui.find({ text: /Audit checkout tests/ })).toBeDefined()
       await ui.press({ key: 'row-s-big' })
       await ui.unmount()
@@ -192,7 +192,7 @@ describe('band', () => {
     const answered = await $.command.run({ command: 'usage-lens', args: 'band on', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } })
     expect(answered.text).toContain('已打开')
     const ui = await $.ui.mount({ plugin: 'usage-lens', surface: 'desktop', ...BAND })
-    expect((await ui.find({ key: 'usage-lens-band' }))?.text).toContain('▸ 展开')
+    expect((await ui.find({ key: 'usage-lens-band' }))?.text).toContain('12%')
     await ui.unmount()
   })
 })
@@ -247,7 +247,7 @@ describe('dollars left', () => {
     for (const surface of ['desktop', 'terminal'] as const) {
       const ui = await $.ui.mount({ plugin: 'usage-lens', surface, component: 'SessionMode', props: { modes: [] } })
       // the scan says $40 for both windows: $40 at 87% leaves about $6, $40 at 12% about $293
-      expect((await ui.find({ key: 'usage-lens-footer' }))?.text).toContain('剩≈$5.98（7d）')
+      expect((await ui.find({ key: 'usage-lens-footer' }))?.text).toContain('剩≈$5.98')
       await ui.unmount()
     }
   })
@@ -319,7 +319,8 @@ describe('the account in dollars', () => {
     for (const surface of ['desktop', 'terminal'] as const) {
       const ui = await $.ui.mount({ plugin: 'usage-lens', surface, component: 'SessionMode', props: { modes: [] } })
       const text = (await ui.find({ key: 'usage-lens-footer' }))?.text ?? ''
-      expect(text).toContain('剩$300（7d）')
+      expect(text).toContain('剩$300')
+      expect(text).not.toContain('剩≈') // the account's own figure is not marked approximate
       expect(text).toContain('额外剩$37.5')
       await ui.unmount()
     }
@@ -375,11 +376,9 @@ describe('does a percent cost what we think', () => {
     const props = { title: '用量透视', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} } as const
     for (const surface of ['desktop', 'terminal'] as const) {
       const ui = await $.ui.mount({ plugin: 'usage-lens', surface, component: 'Pane', requestId: 'usage-lens', props })
-      const text = (await ui.findAll({ type: 'Text', text: /校准/ })).map(x => x.text).join('\n')
-      expect(text).toContain('累计每 1% ≈ $24.0')
-      expect(text).toContain('最近 5 个百分点实际每 1% ≈ $160')
-      expect(text).toContain('估算可能偏少') // the latest percents cost more than the total suggests, so more dollars are left than estimated
-      expect(await ui.find({ type: 'Text', text: /按最近的速率算，约还能用 \$4,005/ })).toBeDefined()
+      // $24 a point since the window began, $160 a point lately: what is left is worked out at the recent rate
+      expect(await ui.find({ type: 'Text', text: /剩≈\$4,005（近期速率）/ })).toBeDefined()
+      expect(await ui.find({ type: 'Text', text: /剩≈\$601/ })).toBeUndefined() // not at the rate since the window began
       await ui.unmount()
     }
   })
@@ -457,13 +456,14 @@ describe('when does it run out', () => {
     // 94% after four hours at a point an hour: 100% six hours on, which is 09:00 in a UTC-7 zone
     for (const surface of ['desktop', 'terminal'] as const) {
       const footer = await $.ui.mount({ plugin: 'usage-lens', surface, component: 'SessionMode', props: { modes: [] } })
-      expect((await footer.find({ key: 'usage-lens-footer' }))?.text).toContain('预计09:00用完（7d）')
+      expect((await footer.find({ key: 'usage-lens-footer' }))?.text).toContain('≈09:00 用完（7d）')
       await footer.unmount()
       const props = { title: '用量透视', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} } as const
       const pane = await $.ui.mount({ plugin: 'usage-lens', surface, component: 'Pane', requestId: 'usage-lens', props })
-      const line = await pane.find({ type: 'Text', text: /预计 09:00 用完/ })
-      expect(line?.text).toContain('按最近 4小时 的速度（1.00 点/小时）')
-      expect(line?.text).toContain('离重置（10-14 05:00）还差 20小时，这段时间会被限住')
+      const line = await pane.find({ type: 'Text', text: /≈09:00 用完/ })
+      expect(line?.text).toContain('10-14 05:00 重置（26h）')
+      expect(line?.text).toContain('1.00点/h')
+      expect(line?.text).toContain('≈09:00 用完，限 20h')
       await pane.unmount()
     }
   })

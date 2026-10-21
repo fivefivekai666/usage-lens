@@ -24,6 +24,16 @@ export function clock(ts: number, tz: number, withDate: boolean) {
   return withDate ? `${iso.slice(5, 10)} ${iso.slice(11, 16)}` : iso.slice(11, 16)
 }
 
+// A span in as few characters as read well: 45分, 2.7h, 20h, 2.5天.
+export function shortSpan(ms: number) {
+  const m = Math.max(0, Math.round(ms / 60e3))
+  if (m < 60) return `${m}分`
+  const h = m / 60
+  if (h < 10) return `${Math.round(h * 10) / 10}h`
+  if (h < 48) return `${Math.round(h)}h`
+  return `${(h / 24).toFixed(1)}天`
+}
+
 export function duration(ms: number) {
   const m = Math.max(0, Math.round(ms / 60e3))
   if (m < 60) return `${m}分`
@@ -65,21 +75,35 @@ export function windowRemaining(quota: Quota | null, limit: Limit): number | nul
   return w ? remainingUsd(w.cost, limit.percentUsed) : null
 }
 
-// Dollars left in a window: the account's own figure when its plan has one, else the estimate.
-export type Left = { usd: number; isExact: boolean }
-export function windowLeft(quota: Quota | null, limit: Limit): Left | null {
+// Past this much difference between the cost of a percent lately and since the window began, the
+// recent rate is the better guide to what is left.
+export const DRIFT_LIMIT = 0.25
+
+// Dollars left in a window: the account's own figure when its plan has one, else the estimate,
+// at the recent rate when that differs a lot from the rate since the window began.
+export type Left = { usd: number; isExact: boolean; isRecent: boolean }
+export function windowLeft(quota: Quota | null, limit: Limit, calib: readonly Sample[] = []): Left | null {
   const real = quota?.dollars?.[limit.kind]
-  if (real) return { usd: real.remaining, isExact: true }
+  if (real) return { usd: real.remaining, isExact: true, isRecent: false }
   const estimate = windowRemaining(quota, limit)
-  return estimate === null ? null : { usd: estimate, isExact: false }
+  if (estimate === null) return null
+  const c = calibrate(calib, limit.kind, limit.resetsAt)
+  if (c.recent !== null && c.drift !== null && Math.abs(c.drift) > DRIFT_LIMIT) {
+    return { usd: c.recent * (100 - limit.percentUsed), isExact: false, isRecent: true }
+  }
+  return { usd: estimate, isExact: false, isRecent: false }
 }
 
 // The window that runs out first: the one with the fewest dollars left.
-export function tightest(quota: Quota | null, limits: readonly Limit[]): { limit: Limit; remaining: number; isExact: boolean } | undefined {
-  let best: { limit: Limit; remaining: number; isExact: boolean } | undefined
+export function tightest(
+  quota: Quota | null,
+  limits: readonly Limit[],
+  calib: readonly Sample[] = [],
+): { limit: Limit; remaining: number; isExact: boolean; isRecent: boolean } | undefined {
+  let best: { limit: Limit; remaining: number; isExact: boolean; isRecent: boolean } | undefined
   for (const limit of limits) {
-    const left = windowLeft(quota, limit)
-    if (left && (!best || left.usd < best.remaining)) best = { limit, remaining: left.usd, isExact: left.isExact }
+    const left = windowLeft(quota, limit, calib)
+    if (left && (!best || left.usd < best.remaining)) best = { limit, remaining: left.usd, isExact: left.isExact, isRecent: left.isRecent }
   }
   return best
 }

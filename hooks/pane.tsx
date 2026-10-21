@@ -4,13 +4,9 @@ import type { Limit, Limits, Metric, ModelUse, Quota, Range, RangeKind, Report, 
 import { COLORS, OTHER, meterColor, meterSvg, shareSvg, stackSvg, timelineSvg } from './charts'
 import {
   HOUR,
-  MIN_ESTIMATE_PCT,
-  RECENT_PTS,
   bar,
-  calibrate,
   clip,
   clock,
-  duration,
   etaOf,
   group,
   isClaude,
@@ -18,8 +14,8 @@ import {
   modelName,
   percent,
   severity,
+  shortSpan,
   showValue,
-  signedPercent,
   tokens,
   usd,
   valueOf,
@@ -28,8 +24,8 @@ import {
 
 export type Ui = Elements[keyof Elements]
 
-// A line under a meter: plain, or coloured when it is a warning.
-type FootLine = string | { text: string; tone: 'warning' | 'error' }
+// One piece of the line under a meter: plain, or coloured when it is a warning.
+type Seg = string | { text: string; tone: 'warning' | 'error' }
 
 export const RANGES: { kind: RangeKind; label: string; group: 'window' | 'recent' }[] = [
   { kind: 'window5h', label: '5h窗口', group: 'window' },
@@ -67,9 +63,9 @@ export type PaneData = {
 
 const projectName = (s: SessionUse) => s.cwd || s.project
 
-// The whole pane. Columns are Boxes with a width, never padded text, so rows line
-// up in a proportional font too; bars are an Svg where the surface draws one and
-// block characters where it does not.
+// The whole pane. Columns are Boxes with a width, never padded text, so rows line up in a
+// proportional font too; bars are an Svg where the surface draws one and block characters where
+// it does not. Words are kept to what is not obvious: figures first, a sentence only to warn.
 export function drawPane(ui: Ui, d: PaneData) {
   const { Box, Text, Button } = ui
   const { report, limits, scan, quota, calib, range, metric, expanded, self, actions } = d
@@ -91,8 +87,30 @@ export function drawPane(ui: Ui, d: PaneData) {
       </Box>
     ) : null
 
-  const meter = (key: string, label: string, pct: number, frac: number, color: string, foot: FootLine[]) => {
+  // A window's meter: name and percent, the bar, and one line of figures.
+  const meter = (key: string, label: string, pct: number, frac: number, color: string, segs: Seg[]) => {
     const b = bar(frac, textW)
+    const line: JSX.Element[] = []
+    segs.forEach((seg, i) => {
+      if (i > 0) {
+        line.push(
+          <Text key={`${key}-sep${i}`} dimColor>
+            {' · '}
+          </Text>,
+        )
+      }
+      line.push(
+        typeof seg === 'string' ? (
+          <Text key={`${key}-seg${i}`} dimColor>
+            {seg}
+          </Text>
+        ) : (
+          <Text key={`${key}-seg${i}`} color={seg.tone}>
+            {seg.text}
+          </Text>
+        ),
+      )
+    })
     return (
       <Box key={key} flexDirection="column">
         <Box flexDirection="row" justifyContent="space-between">
@@ -109,17 +127,11 @@ export function drawPane(ui: Ui, d: PaneData) {
             <Text dimColor>{b.off}</Text>
           </Text>
         )}
-        {foot.map((line, i) =>
-          typeof line === 'string' ? (
-            <Text key={`${key}-foot${i}`} dimColor wrap="wrap">
-              {line}
-            </Text>
-          ) : (
-            <Text key={`${key}-foot${i}`} color={line.tone} wrap="wrap">
-              {line.text}
-            </Text>
-          ),
-        )}
+        {line.length > 0 ? (
+          <Text key={`${key}-line`} wrap="wrap">
+            {line}
+          </Text>
+        ) : null}
       </Box>
     )
   }
@@ -153,9 +165,7 @@ export function drawPane(ui: Ui, d: PaneData) {
       <Box flexDirection="row" justifyContent="space-between" alignItems="center">
         <Box flexDirection="row" columnGap={2}>
           <Text bold>用量透视</Text>
-          <Text dimColor>
-            {scan.isBusy ? '扫描中…' : report ? `更新于 ${clock(scan.at ?? report.now, report.tzOffset, false)} · ${report.stats.ms}ms` : ''}
-          </Text>
+          <Text dimColor>{scan.isBusy ? '扫描中…' : report ? clock(scan.at ?? report.now, report.tzOffset, false) : ''}</Text>
         </Box>
         <Button key="refresh" label="刷新" onPress={actions.refresh} />
       </Box>
@@ -170,8 +180,8 @@ export function drawPane(ui: Ui, d: PaneData) {
       {d.canInput && 'Input' in ui ? (
         <ui.Input
           key="custom"
-          label="自定义时段"
-          placeholder="10:00-14:00 · 10-12 08:00~18:00 · 3h · 2026-10-11"
+          label="时段"
+          placeholder="10:00-14:00 · 3h · 10-11"
           value={range.kind === 'custom' ? range.text ?? '' : ''}
           submitLabel="查看"
           onSubmit={text => actions.custom(text)}
@@ -182,80 +192,44 @@ export function drawPane(ui: Ui, d: PaneData) {
 
   // ---------------------------------------------------------------- the account's windows
 
-  // Does a percent cost what the estimate assumes? Compares the dollars per percent since the
-  // window began with what the latest stretch cost, from the readings kept.
-  const calibration = (l: Limit): string[] => {
-    const c = calibrate(calib, l.kind, l.resetsAt)
-    if (c.overall === null) return []
-    if (c.recent === null || c.drift === null) {
-      return [`校准：累计每 1% ≈ ${usd(c.overall)}；最近涨的还不到 ${RECENT_PTS} 个百分点，看不出速率有没有变`]
-    }
-    const verdict = Math.abs(c.drift) > 0.25 ? `，差得多，上面的估算可能${c.drift > 0 ? '偏少' : '偏多'}` : '，和累计比例基本一致'
-    const byRecent = c.recent * (100 - l.percentUsed)
-    return [
-      `校准：累计每 1% ≈ ${usd(c.overall)}；最近 ${Math.round(c.points)} 个百分点实际每 1% ≈ ${usd(c.recent)}（${signedPercent(c.drift)}）${verdict}`,
-      ...(Math.abs(c.drift) > 0.25 ? [`按最近的速率算，约还能用 ${usd(byRecent)}`] : []),
-    ]
-  }
-
   const limitRows = (limits?.items ?? []).filter((l: Limit) => l.kind === 'five_hour' || l.kind === 'seven_day')
   const now = report?.now ?? limits?.at ?? 0
   const tz = quota?.tz ?? report?.tzOffset ?? 0
 
-  // At the pace of the latest stretch: when does this window run out, or where does it stand when it resets?
-  const outlook = (l: Limit): FootLine[] => {
-    const e = etaOf(calib, l, now)
-    if (!e) return []
+  // One line per window: when it resets, what is left, how fast it is going and where that ends.
+  const figures = (l: Limit): Seg[] => {
     const at = (ms: number) => clock(ms, tz, ms - now > 12 * HOUR)
-    const pace = e.pace >= 10 ? e.pace.toFixed(1) : e.pace.toFixed(2)
-    const basis = `按最近 ${duration(e.span)} 的速度（${pace} 点/小时${e.isRough ? '，样本少，粗估' : ''}）`
-    if (e.runsOutAt < e.resetsAt) {
-      return [
-        {
-          tone: e.runsOutAt - now < 2 * HOUR ? 'error' : 'warning',
-          text: `${basis}，预计 ${at(e.runsOutAt)} 用完；离重置（${at(e.resetsAt)}）还差 ${duration(e.resetsAt - e.runsOutAt)}，这段时间会被限住`,
-        },
-      ]
+    const resets = l.resetsAt ? Date.parse(l.resetsAt) : NaN
+    const segs: Seg[] = []
+    if (Number.isFinite(resets)) segs.push(`${at(resets)} 重置（${shortSpan(resets - now)}）`)
+    const left = windowLeft(quota, l, calib)
+    if (left) segs.push(`剩${left.isExact ? '' : '≈'}${usd(left.usd)}${left.isRecent ? '（近期速率）' : ''}`)
+    const e = etaOf(calib, l, now)
+    if (e) {
+      segs.push(`${e.pace >= 10 ? e.pace.toFixed(1) : e.pace.toFixed(2)}点/h${e.isRough ? '（粗估）' : ''}`)
+      segs.push(
+        e.runsOutAt < e.resetsAt
+          ? { tone: e.runsOutAt - now < 2 * HOUR ? 'error' : 'warning', text: `≈${at(e.runsOutAt)} 用完，限 ${shortSpan(e.resetsAt - e.runsOutAt)}` }
+          : `重置时≈${Math.round(e.atReset)}%`,
+      )
     }
-    return [`${basis}，到重置（${at(e.resetsAt)}）大约会用到 ${Math.round(e.atReset)}%，撑得住`]
+    return segs
   }
+
+  const extraMeter = (x: NonNullable<Quota['extra']>) => {
+    const frac = x.used / Math.max(x.limit, 0.01)
+    return meter('limit-extra', '额外用量', Math.round(frac * 100), frac, meterColor(frac * 100), [`${usd(x.used)} / ${usd(x.limit)}`, `剩 ${usd(x.remaining)}`])
+  }
+
   const limitCard = (
     <Box key="limits" flexDirection="column" rowGap={1} borderStyle="round" borderColor="subtle" paddingX={1}>
       {limitRows.length > 0 ? (
-        limitRows.map(l => {
-          const resets = l.resetsAt ? Date.parse(l.resetsAt) : NaN
-          const left = windowLeft(quota, l)
-          const exact = quota?.dollars?.[l.kind]
-          const foot: FootLine[] = [
-            Number.isFinite(resets) ? `${clock(resets, tz, l.kind !== 'five_hour')} 重置 · 还有 ${duration(resets - now)}` : '',
-            exact
-              ? `额度 ${usd(exact.limit)}，已用 ${usd(exact.used)}，还剩 ${usd(exact.remaining)}`
-              : left
-                ? `约还能用 ${usd(left.usd)}（API 等价；按本机已用 ${l.percentUsed}% 的花费估算，偏保守）`
-                : l.percentUsed < MIN_ESTIMATE_PCT
-                  ? `已用不到 ${MIN_ESTIMATE_PCT}%，还估不出剩多少美元`
-                  : '',
-            ...(exact || !left ? [] : calibration(l)),
-            ...outlook(l),
-          ].filter(line => line !== '')
-          return meter(`limit-${l.kind}`, limitLabel(l.kind), l.percentUsed, l.percentUsed / 100, meterColor(l.percentUsed), foot)
-        })
-          .concat(
-            quota?.extra
-              ? [
-                  meter(
-                    'limit-extra',
-                    '额外用量',
-                    Math.round((quota.extra.used / Math.max(quota.extra.limit, 0.01)) * 100),
-                    quota.extra.used / Math.max(quota.extra.limit, 0.01),
-                    meterColor((quota.extra.used / Math.max(quota.extra.limit, 0.01)) * 100),
-                    [`已用 ${usd(quota.extra.used)} / ${usd(quota.extra.limit)}，还剩 ${usd(quota.extra.remaining)}`],
-                  ),
-                ]
-              : [],
-          )
+        [
+          ...limitRows.map(l => meter(`limit-${l.kind}`, limitLabel(l.kind), l.percentUsed, l.percentUsed / 100, meterColor(l.percentUsed), figures(l))),
+          ...(quota?.extra ? [extraMeter(quota.extra)] : []),
+        ]
       ) : (
-        <Text dimColor>还没有 5h / 7d 限额读数：本会话发出第一个 API 请求后才有；用 API key 登录的话没有这类限额。</Text>
+        <Text dimColor>还没有 5h / 7d 读数，发出第一个请求后出现。</Text>
       )}
     </Box>
   )
@@ -265,11 +239,7 @@ export function drawPane(ui: Ui, d: PaneData) {
       <Box flexDirection="column" rowGap={1}>
         {top}
         {limitCard}
-        {scan.error ? (
-          <Text color="error">出错：{scan.error}</Text>
-        ) : (
-          <Text dimColor>{scan.isBusy ? '正在扫描本机转录…' : '点「刷新」开始扫描'}</Text>
-        )}
+        {scan.error ? <Text color="error">出错：{scan.error}</Text> : <Text dimColor>{scan.isBusy ? '扫描中…' : '点「刷新」开始'}</Text>}
       </Box>
     )
   }
@@ -278,8 +248,6 @@ export function drawPane(ui: Ui, d: PaneData) {
 
   const total = valueOf(report.total, metric)
   const long = report.to - report.from > 20 * HOUR
-  const five = report.window?.kind === 'five_hour' ? limits?.items.find(l => l.kind === 'five_hour') ?? report.window : undefined
-  const perPoint = five && five.percentUsed > 0 ? report.total.cost / five.percentUsed : 0
   const titles = new Map(report.sessions.map(s => [s.sid, clip(s.title || s.sid.slice(0, 8), 40)]))
   const colorOf = new Map(report.timeline.keys.filter(k => k !== '_other').map((k, i) => [k, COLORS[i] ?? OTHER]))
   const cacheBase = report.total.cr + report.total.in + report.total.cw
@@ -295,30 +263,17 @@ export function drawPane(ui: Ui, d: PaneData) {
 
   const summary = (
     <Box key="summary" flexDirection="column" rowGap={1}>
-      <Text>
-        <Text bold>
-          {clock(report.from, tz, long)} – {clock(report.to, tz, long)}
-        </Text>
-        <Text dimColor>　{duration(report.to - report.from)}</Text>
+      <Text bold>
+        {clock(report.from, tz, long)} – {clock(report.to, tz, long)}
       </Text>
       <Box flexDirection="row" flexWrap="wrap" columnGap={4} rowGap={1}>
-        {tile('t-cost', usd(report.total.cost), '成本（API 等价）')}
+        {tile('t-cost', usd(report.total.cost), '成本')}
         {tile('t-tok', tokens(report.total.tok), 'tokens')}
-        {tile('t-req', group(report.total.req), '次请求')}
+        {tile('t-req', group(report.total.req), '请求')}
         {tile('t-cache', percent(cacheBase ? report.total.cr / cacheBase : 0), '缓存命中')}
-        {tile('t-sess', String(report.sessionCount), '个会话')}
       </Box>
-      {perPoint > 0 ? (
-        <Text dimColor wrap="wrap">
-          窗口已用 {five?.percentUsed}%，本机记录 {usd(report.total.cost)}，约合每 1% = {usd(perPoint)}。其他设备的用量也算在这个百分比里，所以下面的「点」会偏高。
-        </Text>
-      ) : null}
       {report.note ? <Text color="warning">{report.note}</Text> : null}
-      {nonClaude.length > 0 ? (
-        <Text dimColor wrap="wrap">
-          非 Claude 模型（不计成本、不占 5h 额度）：{nonClaude.map(m => `${m.model} ${group(m.req)} 次 / ${tokens(m.tok)}`).join(' · ')}
-        </Text>
-      ) : null}
+      {nonClaude.length > 0 ? <Text dimColor>非 Claude：{nonClaude.map(m => `${m.model} ${group(m.req)} 次`).join(' · ')}</Text> : null}
     </Box>
   )
 
@@ -331,11 +286,10 @@ export function drawPane(ui: Ui, d: PaneData) {
     color: COLORS[i] ?? OTHER,
     label: `${modelName(m.model)} ${percent(total ? valueOf(m, metric) / total : 0)} · ${showValue(valueOf(m, metric), metric)}`,
     frac: total ? valueOf(m, metric) / total : 0,
-    name: modelName(m.model),
   }))
   const modelBlock = (
     <Box key="models" flexDirection="column" rowGap={1}>
-      {section('models-h', '按模型')}
+      {section('models-h', '模型')}
       {hasSvg ? svgBar('models-bar', stackSvg(modelItems.map(m => ({ frac: m.frac, color: m.color, label: m.label }))), '各模型占比') : null}
       {legend('models-legend', modelItems)}
     </Box>
@@ -349,58 +303,47 @@ export function drawPane(ui: Ui, d: PaneData) {
         {cell(`${sid}-${tag}-m${i}-n`, 13, 'left', <Text>{modelName(m.model)}</Text>)}
         {cell(`${sid}-${tag}-m${i}-v`, 8, 'right', <Text bold>{showValue(valueOf(m, metric), metric)}</Text>)}
         {cell(`${sid}-${tag}-m${i}-p`, 6, 'right', <Text dimColor>{percent(base ? valueOf(m, metric) / base : 0)}</Text>)}
-        {cell(`${sid}-${tag}-m${i}-r`, 7, 'right', <Text dimColor>{group(m.req)} 次</Text>)}
-        <Box flexGrow={1} flexShrink={1}>
-          <Text dimColor wrap="truncate-end">
-            出 {tokens(m.out)} · 缓存写 {tokens(m.cw)} · 缓存读 {tokens(m.cr)}
-          </Text>
-        </Box>
+        {cell(`${sid}-${tag}-m${i}-r`, 8, 'right', <Text dimColor>{group(m.req)} 次</Text>)}
       </Box>
     ))
 
-  const agentHead = (key: string, title: string, value: string, frac: number, extra: string) => (
+  const agentHead = (key: string, title: string, value: string, frac: number, extra?: string) => (
     <Box key={key} flexDirection="row" columnGap={2}>
       <Text bold>{title}</Text>
       <Text>{value}</Text>
-      <Text dimColor>
-        {percent(frac)} · {extra}
-      </Text>
+      <Text dimColor>{extra ? `${percent(frac)} · ${extra}` : percent(frac)}</Text>
     </Box>
   )
 
   const detail = (s: SessionUse) => {
     const sv = valueOf(s.all, metric)
+    const hasTypes = s.types.length > 1
     const rows = [
-      agentHead(`${s.sid}-main`, '主 agent', showValue(valueOf(s.main, metric), metric), sv ? valueOf(s.main, metric) / sv : 0, `${group(s.main.req)} 次`),
+      agentHead(`${s.sid}-main`, '主 agent', showValue(valueOf(s.main, metric), metric), sv ? valueOf(s.main, metric) / sv : 0),
       ...modelRows(s.sid, 'main', s.main.models ?? [], valueOf(s.main, metric)),
     ]
     if (s.agentCount > 0) {
       rows.push(
         <Box key={`${s.sid}-gap`} height={1} />,
-        agentHead(
-          `${s.sid}-sub`,
-          '子 agent',
-          showValue(valueOf(s.sub, metric), metric),
-          sv ? valueOf(s.sub, metric) / sv : 0,
-          `${s.agentCount} 个 · ${group(s.sub.req)} 次`,
-        ),
+        agentHead(`${s.sid}-sub`, '子 agent', showValue(valueOf(s.sub, metric), metric), sv ? valueOf(s.sub, metric) / sv : 0, `${s.agentCount} 个`),
         ...modelRows(s.sid, 'sub', s.sub.models ?? [], valueOf(s.sub, metric)),
-        <Box key={`${s.sid}-types`} flexDirection="column" marginTop={1}>
-          <Text dimColor>按类型</Text>
-          {s.types.map((t, i) => (
-            <Box key={`${s.sid}-t${i}`} flexDirection="row" columnGap={2}>
-              {cell(`${s.sid}-t${i}-n`, 22, 'left', <Text wrap="truncate-end">{t.type} ×{t.n}</Text>)}
-              {cell(`${s.sid}-t${i}-v`, 8, 'right', <Text bold>{showValue(valueOf(t, metric), metric)}</Text>)}
-              <Box flexGrow={1} flexShrink={1}>
-                <Text dimColor wrap="truncate-end">
-                  {(t.models ?? []).map(m => `${modelName(m.model)} ${showValue(valueOf(m, metric), metric)}`).join(' · ')}
-                </Text>
+      )
+      if (hasTypes) {
+        rows.push(
+          <Box key={`${s.sid}-types`} flexDirection="column" marginTop={1}>
+            <Text dimColor>类型</Text>
+            {s.types.map((t, i) => (
+              <Box key={`${s.sid}-t${i}`} flexDirection="row" columnGap={2}>
+                {cell(`${s.sid}-t${i}-n`, 22, 'left', <Text wrap="truncate-end">{t.type} ×{t.n}</Text>)}
+                {cell(`${s.sid}-t${i}-v`, 8, 'right', <Text bold>{showValue(valueOf(t, metric), metric)}</Text>)}
               </Box>
-            </Box>
-          ))}
-        </Box>,
+            ))}
+          </Box>,
+        )
+      }
+      rows.push(
         <Box key={`${s.sid}-top`} flexDirection="column" marginTop={1}>
-          <Text dimColor>用量最高的子 agent{s.agentCount > s.agents.length ? `（前 ${s.agents.length} / ${s.agentCount}）` : ''}</Text>
+          <Text dimColor>最贵的子 agent{s.agentCount > s.agents.length ? `（前 ${s.agents.length}）` : ''}</Text>
           {s.agents.map((a, i) => (
             <Box key={`${s.sid}-a${i}`} flexDirection="row" columnGap={2}>
               {cell(`${s.sid}-a${i}-v`, 8, 'right', <Text bold>{showValue(valueOf(a, metric), metric)}</Text>)}
@@ -409,8 +352,7 @@ export function drawPane(ui: Ui, d: PaneData) {
                   {a.desc || a.aid}
                   <Text dimColor>
                     {'　'}
-                    {a.type}
-                    {a.depth > 1 ? `·第${a.depth}层` : ''} · {(a.models ?? []).map(m => modelName(m.model)).join('+')} · {group(a.req)} 次
+                    {[hasTypes ? a.type : '', (a.models ?? []).map(m => modelName(m.model)).join('+'), `${group(a.req)}次`].filter(Boolean).join(' · ')}
                   </Text>
                 </Text>
               </Box>
@@ -436,7 +378,6 @@ export function drawPane(ui: Ui, d: PaneData) {
     const frac = total ? v / total : 0
     const isOpen = expanded.includes(s.sid)
     const subFrac = v ? valueOf(s.sub, metric) / v : 0
-    const points = perPoint > 0 ? s.all.cost / perPoint : 0
     const color = colorOf.get(s.sid) ?? OTHER
     const b = bar(frac, textW)
     return (
@@ -449,7 +390,6 @@ export function drawPane(ui: Ui, d: PaneData) {
               {s.sid === self ? <Text color="success"> 当前</Text> : ''}
             </Button>
           </Box>
-          {points > 0 ? cell(`pt-${s.sid}`, 9, 'right', <Text dimColor>≈{points.toFixed(1)}点</Text>) : null}
           {cell(`pc-${s.sid}`, 7, 'right', <Text bold>{percent(frac)}</Text>)}
           {cell(`pv-${s.sid}`, 8, 'right', <Text>{showValue(v, metric)}</Text>)}
         </Box>
@@ -466,9 +406,9 @@ export function drawPane(ui: Ui, d: PaneData) {
             {[
               showFolder ? clip(projectName(s), 26) : '',
               `${clock(s.first, tz, long)}–${clock(s.last, tz, false)}`,
-              `${group(s.all.req)} 次`,
-              s.agentCount ? `主 ${percent(1 - subFrac)} / 子 ${percent(subFrac)}（${s.agentCount} 个子 agent）` : '主 agent 100%',
-              s.unpriced ? `${s.unpriced} 次非 Claude` : '',
+              `${group(s.all.req)}次`,
+              s.agentCount ? `子 ${Math.round(subFrac * 100)}%（${s.agentCount}个）` : '',
+              s.unpriced ? `${s.unpriced}次非 Claude` : '',
             ]
               .filter(Boolean)
               .join(' · ')}
@@ -481,11 +421,9 @@ export function drawPane(ui: Ui, d: PaneData) {
 
   const sessions = (
     <Box key="sessions" flexDirection="column" rowGap={1}>
-      {section('sessions-h', '会话占比', hasSvg ? '点一行展开 · 实色＝主 agent，浅色＝子 agent' : '点一行展开')}
+      {section('sessions-h', '会话', '点一行展开')}
       {listed.length === 0 ? <Text dimColor>这个时段没有用量。</Text> : sessionRows}
-      {unlisted > 0 ? (
-        <Text dimColor>另有 {unlisted} 个会话没列出：用量很小，或只用了非 Claude 模型（不计成本）{metric === 'cost' ? '。切到 Token 可以看到后者' : ''}。</Text>
-      ) : null}
+      {unlisted > 0 ? <Text dimColor>另有 {unlisted} 个未列出（用量很小或非 Claude）</Text> : null}
     </Box>
   )
 
@@ -495,21 +433,9 @@ export function drawPane(ui: Ui, d: PaneData) {
       {limitCard}
       {summary}
       {chart}
-      {hasSvg && report.timeline.rows.length > 1
-        ? legend(
-            'timeline-legend',
-            report.timeline.keys.map((k, i) => ({
-              color: k === '_other' ? OTHER : COLORS[i] ?? OTHER,
-              label: k === '_other' ? '其他会话' : titles.get(k) ?? k.slice(0, 8),
-            })),
-          )
-        : null}
       {modelBlock}
       {scan.error ? <Text color="error">上次扫描出错：{scan.error}</Text> : null}
       {sessions}
-      <Text dimColor wrap="wrap">
-        数据来自本机 ~/.claude/projects 的转录（含 subagents/）。其他设备和网页版的用量不在其中。本次扫描 {report.stats.inRange} 个文件，新读 {report.stats.readMB}MB。
-      </Text>
     </Box>
   )
 }
