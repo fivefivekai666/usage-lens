@@ -11,6 +11,7 @@ import {
   clip,
   clock,
   duration,
+  etaOf,
   group,
   isClaude,
   limitLabel,
@@ -26,6 +27,9 @@ import {
 } from './format'
 
 export type Ui = Elements[keyof Elements]
+
+// A line under a meter: plain, or coloured when it is a warning.
+type FootLine = string | { text: string; tone: 'warning' | 'error' }
 
 export const RANGES: { kind: RangeKind; label: string; group: 'window' | 'recent' }[] = [
   { kind: 'window5h', label: '5h窗口', group: 'window' },
@@ -87,7 +91,7 @@ export function drawPane(ui: Ui, d: PaneData) {
       </Box>
     ) : null
 
-  const meter = (key: string, label: string, pct: number, frac: number, color: string, foot: string[]) => {
+  const meter = (key: string, label: string, pct: number, frac: number, color: string, foot: FootLine[]) => {
     const b = bar(frac, textW)
     return (
       <Box key={key} flexDirection="column">
@@ -105,11 +109,17 @@ export function drawPane(ui: Ui, d: PaneData) {
             <Text dimColor>{b.off}</Text>
           </Text>
         )}
-        {foot.map((line, i) => (
-          <Text key={`${key}-foot${i}`} dimColor wrap="wrap">
-            {line}
-          </Text>
-        ))}
+        {foot.map((line, i) =>
+          typeof line === 'string' ? (
+            <Text key={`${key}-foot${i}`} dimColor wrap="wrap">
+              {line}
+            </Text>
+          ) : (
+            <Text key={`${key}-foot${i}`} color={line.tone} wrap="wrap">
+              {line.text}
+            </Text>
+          ),
+        )}
       </Box>
     )
   }
@@ -190,7 +200,25 @@ export function drawPane(ui: Ui, d: PaneData) {
 
   const limitRows = (limits?.items ?? []).filter((l: Limit) => l.kind === 'five_hour' || l.kind === 'seven_day')
   const now = report?.now ?? limits?.at ?? 0
-  const tz = report?.tzOffset ?? 0
+  const tz = quota?.tz ?? report?.tzOffset ?? 0
+
+  // At the pace of the latest stretch: when does this window run out, or where does it stand when it resets?
+  const outlook = (l: Limit): FootLine[] => {
+    const e = etaOf(calib, l, now)
+    if (!e) return []
+    const at = (ms: number) => clock(ms, tz, ms - now > 12 * HOUR)
+    const pace = e.pace >= 10 ? e.pace.toFixed(1) : e.pace.toFixed(2)
+    const basis = `按最近 ${duration(e.span)} 的速度（${pace} 点/小时${e.isRough ? '，样本少，粗估' : ''}）`
+    if (e.runsOutAt < e.resetsAt) {
+      return [
+        {
+          tone: e.runsOutAt - now < 2 * HOUR ? 'error' : 'warning',
+          text: `${basis}，预计 ${at(e.runsOutAt)} 用完；离重置（${at(e.resetsAt)}）还差 ${duration(e.resetsAt - e.runsOutAt)}，这段时间会被限住`,
+        },
+      ]
+    }
+    return [`${basis}，到重置（${at(e.resetsAt)}）大约会用到 ${Math.round(e.atReset)}%，撑得住`]
+  }
   const limitCard = (
     <Box key="limits" flexDirection="column" rowGap={1} borderStyle="round" borderColor="subtle" paddingX={1}>
       {limitRows.length > 0 ? (
@@ -198,7 +226,7 @@ export function drawPane(ui: Ui, d: PaneData) {
           const resets = l.resetsAt ? Date.parse(l.resetsAt) : NaN
           const left = windowLeft(quota, l)
           const exact = quota?.dollars?.[l.kind]
-          const foot = [
+          const foot: FootLine[] = [
             Number.isFinite(resets) ? `${clock(resets, tz, l.kind !== 'five_hour')} 重置 · 还有 ${duration(resets - now)}` : '',
             exact
               ? `额度 ${usd(exact.limit)}，已用 ${usd(exact.used)}，还剩 ${usd(exact.remaining)}`
@@ -208,7 +236,8 @@ export function drawPane(ui: Ui, d: PaneData) {
                   ? `已用不到 ${MIN_ESTIMATE_PCT}%，还估不出剩多少美元`
                   : '',
             ...(exact || !left ? [] : calibration(l)),
-          ].filter(Boolean)
+            ...outlook(l),
+          ].filter(line => line !== '')
           return meter(`limit-${l.kind}`, limitLabel(l.kind), l.percentUsed, l.percentUsed / 100, meterColor(l.percentUsed), foot)
         })
           .concat(

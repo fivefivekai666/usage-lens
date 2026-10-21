@@ -121,3 +121,60 @@ export function calibrate(samples: readonly Sample[], kind: string, resetsAt: st
 }
 
 export const signedPercent = (x: number) => `${x >= 0 ? '+' : '−'}${Math.round(Math.abs(x) * 100)}%`
+
+// ---------------------------------------------------------------- when does it run out?
+
+// A pace is read over the shortest recent stretch that moved at least this many points
+// (the percentage is whole numbers, so fewer points are mostly rounding). Taking the shortest
+// such stretch keeps a fast window's pace recent; looking back three days lets a slow one find four.
+export const ETA_PTS = 4
+export const ETA_LOOKBACK = 72 * HOUR
+
+export type Eta = {
+  kind: string
+  pace: number // percentage points per hour
+  span: number // how long a stretch the pace was read over, in ms
+  runsOutAt: number // when the window would reach 100% at that pace, in ms
+  resetsAt: number
+  atReset: number // the percentage it would have reached when the window resets, at most 100
+  isRough: boolean // read over a stretch of fewer than ETA_PTS points
+}
+
+// At the pace of the latest stretch, when does this window reach 100%, and where would it
+// stand when it resets? From the readings kept, which say when each percent was first seen.
+export function etaOf(samples: readonly Sample[], limit: Limit, now: number): Eta | null {
+  const resetsAt = limit.resetsAt ? Date.parse(limit.resetsAt) : NaN
+  if (!Number.isFinite(resetsAt) || resetsAt <= now) return null
+  const mine = samples.filter(s => s.kind === limit.kind && s.resetsAt === limit.resetsAt).sort((a, b) => a.at - b.at)
+  const last = mine[mine.length - 1]
+  if (!last) return null
+  const recent = mine.slice(0, -1).filter(s => last.at - s.at <= ETA_LOOKBACK)
+  let from = [...recent].reverse().find(s => last.pct - s.pct >= ETA_PTS)
+  let isRough = false
+  if (!from) {
+    from = recent.find(s => last.pct - s.pct >= 2)
+    isRough = true
+  }
+  if (!from || last.at <= from.at) return null
+  const dPct = last.pct - from.pct
+  let span = last.at - from.at
+  let pace = (dPct / span) * HOUR
+  // Waiting longer for the next point than the stretch's pace allows means it has slowed: count the wait.
+  const since = Math.max(0, now - last.at)
+  if ((since / HOUR) * pace > 1) {
+    span += since
+    pace = (dPct / span) * HOUR
+  }
+  const reached = Math.min(0.99, (since / HOUR) * pace) // part of a point gained since the last change
+  const hoursLeft = Math.max(0, 100 - last.pct - reached) / pace
+  const runsOutAt = now + hoursLeft * HOUR
+  const atReset = Math.min(100, last.pct + reached + (pace * (resetsAt - now)) / HOUR)
+  return { kind: limit.kind, pace, span, runsOutAt, resetsAt, atReset, isRough }
+}
+
+// The window that runs out first of those that run out before they reset.
+export function firstToRunOut(etas: readonly (Eta | null)[]): Eta | undefined {
+  let best: Eta | undefined
+  for (const e of etas) if (e && e.runsOutAt < e.resetsAt && (!best || e.runsOutAt < best.runsOutAt)) best = e
+  return best
+}

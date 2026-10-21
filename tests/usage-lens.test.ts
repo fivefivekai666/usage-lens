@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 
 import { money, parseAccountUsage } from '../hooks/account'
-import { calibrate, remainingUsd, signedPercent, tightest, usdShort, windowRemaining } from '../hooks/format'
+import { calibrate, etaOf, firstToRunOut, remainingUsd, signedPercent, tightest, usdShort, windowRemaining } from '../hooks/format'
 import { bandStat, modelName, specFor, summaryText } from '../hooks/register'
 import type { Limits, Report } from '../types'
 
@@ -381,6 +381,90 @@ describe('does a percent cost what we think', () => {
       expect(text).toContain('估算可能偏少') // the latest percents cost more than the total suggests, so more dollars are left than estimated
       expect(await ui.find({ type: 'Text', text: /按最近的速率算，约还能用 \$4,005/ })).toBeDefined()
       await ui.unmount()
+    }
+  })
+})
+
+describe('when does it run out', () => {
+  const round3 = (x: number) => Math.round(x * 1000) / 1000
+  const R = new Date(NOW + 30 * HOUR).toISOString()
+  const limit = { kind: 'seven_day', percentUsed: 94, resetsAt: R }
+  const seen = (pct: number, hours: number) => ({ at: NOW + hours * HOUR, kind: 'seven_day', resetsAt: R, pct, cost: 0 })
+  const hourly = [90, 91, 92, 93, 94].map((pct, i) => seen(pct, i)) // a point an hour
+
+  test('at the pace of the latest stretch of four points', async () => {
+    const now = NOW + 4 * HOUR
+    const e = etaOf(hourly, limit, now)
+    expect(round3(e?.pace ?? 0)).toBe(1)
+    expect(e?.span).toBe(4 * HOUR)
+    expect(e?.isRough).toBe(false)
+    expect(e?.runsOutAt).toBe(now + 6 * HOUR) // six points left at one an hour
+    expect(Math.round(e?.atReset ?? 0)).toBe(100) // it would be past 100% long before the reset
+  })
+
+  test('a wait longer than the pace allows counts as slowing down', async () => {
+    const e = etaOf(hourly, limit, NOW + 7 * HOUR) // three hours since the last point
+    expect(e?.pace).toBeLessThan(1)
+    expect((e?.runsOutAt ?? 0) > NOW + 7 * HOUR + 6 * HOUR).toBe(true)
+  })
+
+  test('a slow window outlasts its reset, and says where it will stand', async () => {
+    const resetsAt = new Date(NOW + 64 * HOUR).toISOString()
+    const slow = [90, 91, 92, 93, 94].map((pct, i) => ({ ...seen(pct, i * 15), resetsAt })) // a point per 15 hours
+    const e = etaOf(slow, { ...limit, resetsAt }, NOW + 62 * HOUR)
+    expect(e !== null && e.runsOutAt < e.resetsAt).toBe(false)
+    expect(Math.round(e?.atReset ?? 0)).toBe(94) // two hours to go, a fraction of a point
+    expect(firstToRunOut([e])).toBeUndefined()
+  })
+
+  test('too few points, or a window that has already reset, give nothing', async () => {
+    expect(etaOf([seen(90, 0), seen(91, 1)], limit, NOW + 2 * HOUR)).toBeNull()
+    expect(etaOf([], limit, NOW)).toBeNull()
+    expect(etaOf(hourly, limit, NOW + 31 * HOUR)).toBeNull() // past the reset
+  })
+
+  test('three points are enough for a rough figure', async () => {
+    const e = etaOf([90, 91, 92, 93].map((pct, i) => seen(pct, i)), { ...limit, percentUsed: 93 }, NOW + 3 * HOUR)
+    expect(e?.isRough).toBe(true)
+    expect(round3(e?.pace ?? 0)).toBe(1)
+  })
+
+  test('the first to run out is the earliest of those that do before they reset', async () => {
+    const early = { kind: 'five_hour', pace: 3, span: HOUR, runsOutAt: 10, resetsAt: 50, atReset: 100, isRough: false }
+    const late = { ...early, kind: 'seven_day', runsOutAt: 20 }
+    const safe = { ...early, kind: 'seven_day', runsOutAt: 90 } // after its reset
+    expect(firstToRunOut([late, early, null])?.kind).toBe('five_hour')
+    expect(firstToRunOut([safe])).toBeUndefined()
+  })
+
+  test('the footer and the pane say when the window runs out at the latest pace', async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    mock.store(on)
+    on('session.measure', ($, e) => ({ changed: e.changed }))
+    on('process.run', () => ({
+      value: { exitCode: 0, stdout: JSON.stringify(REPORT), stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+    }))
+    const resetsAt = new Date(NOW + 30 * HOUR).toISOString()
+    for (let i = 0; i < 5; i++) {
+      await $.session.measure({
+        context: { window: 1_000_000 },
+        rateLimits: [{ kind: 'seven_day', percentUsed: 90 + i, resetsAt }],
+        changed: ['rateLimits'],
+      })
+      await clock.advance(1000) // the week is scanned and the point is kept
+      if (i < 4) await clock.advance(HOUR - 1000) // a point an hour
+    }
+    // 94% after four hours at a point an hour: 100% six hours on, which is 09:00 in a UTC-7 zone
+    for (const surface of ['desktop', 'terminal'] as const) {
+      const footer = await $.ui.mount({ plugin: 'usage-lens', surface, component: 'SessionMode', props: { modes: [] } })
+      expect((await footer.find({ key: 'usage-lens-footer' }))?.text).toContain('预计09:00用完（7d）')
+      await footer.unmount()
+      const props = { title: '用量透视', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} } as const
+      const pane = await $.ui.mount({ plugin: 'usage-lens', surface, component: 'Pane', requestId: 'usage-lens', props })
+      const line = await pane.find({ type: 'Text', text: /预计 09:00 用完/ })
+      expect(line?.text).toContain('按最近 4小时 的速度（1.00 点/小时）')
+      expect(line?.text).toContain('离重置（10-14 05:00）还差 20小时，这段时间会被限住')
+      await pane.unmount()
     }
   })
 })

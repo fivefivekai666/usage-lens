@@ -48,7 +48,8 @@ export type QuotaWindow = { kind: string; resetsAt?: string; cost: number }
 export type ExtraUsage = { limit: number; used: number; remaining: number }
 // `dollars` is what the account reports per window when its plan is metered in dollars.
 export type WindowDollars = { limit: number; used: number; remaining: number }
-export type Quota = { at: number; windows: QuotaWindow[]; extra?: ExtraUsage; dollars?: Record<string, WindowDollars> }
+// `tz` is the machine's offset from UTC in minutes, as `Date.getTimezoneOffset()` gives it, for printing clock times.
+export type Quota = { at: number; tz?: number; windows: QuotaWindow[]; extra?: ExtraUsage; dollars?: Record<string, WindowDollars> }
 // One reading of a window: the percent the account said, and what this machine had spent in
 // that window by then. Kept (across sessions) to see how many dollars a percent really costs.
 export type Sample = { at: number; kind: string; resetsAt: string; pct: number; cost: number }
