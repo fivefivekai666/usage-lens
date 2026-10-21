@@ -378,7 +378,7 @@ describe('does a percent cost what we think', () => {
       const text = (await ui.findAll({ type: 'Text', text: /校准/ })).map(x => x.text).join('\n')
       expect(text).toContain('累计每 1% ≈ $24.0')
       expect(text).toContain('最近 5 个百分点实际每 1% ≈ $160')
-      expect(text).toContain('估算可能偏多')
+      expect(text).toContain('估算可能偏少') // the latest percents cost more than the total suggests, so more dollars are left than estimated
       expect(await ui.find({ type: 'Text', text: /按最近的速率算，约还能用 \$4,005/ })).toBeDefined()
       await ui.unmount()
     }

@@ -180,7 +180,7 @@ export function drawPane(ui: Ui, d: PaneData) {
     if (c.recent === null || c.drift === null) {
       return [`校准：累计每 1% ≈ ${usd(c.overall)}；最近涨的还不到 ${RECENT_PTS} 个百分点，看不出速率有没有变`]
     }
-    const verdict = Math.abs(c.drift) > 0.25 ? `，差得多，上面的估算可能${c.drift > 0 ? '偏多' : '偏少'}` : '，和累计比例基本一致'
+    const verdict = Math.abs(c.drift) > 0.25 ? `，差得多，上面的估算可能${c.drift > 0 ? '偏少' : '偏多'}` : '，和累计比例基本一致'
     const byRecent = c.recent * (100 - l.percentUsed)
     return [
       `校准：累计每 1% ≈ ${usd(c.overall)}；最近 ${Math.round(c.points)} 个百分点实际每 1% ≈ ${usd(c.recent)}（${signedPercent(c.drift)}）${verdict}`,
