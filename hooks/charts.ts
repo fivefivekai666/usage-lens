@@ -15,11 +15,31 @@ const open = (w: number, h: number, extra = '') =>
   `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}">${extra}`
 const track = (w: number, h: number) => `<rect width="${w}" height="${h}" rx="${h / 2}" fill="${GRAY}" fill-opacity=".2"/>`
 
-// A rounded progress meter: how much of a window is used.
-export function meterSvg(frac: number, color: string, h = 10) {
+// The thresholds the meter changes colour at, as fractions of the bar.
+export const AMBER_AT = 0.75
+export const RED_AT = 0.9
+const MARK = 3 // how far the target mark sticks out above and below the bar
+
+// A progress meter drawn as a bullet chart: the bar is how much of a window is used, the
+// track behind it is tinted where it turns amber and red, and a mark stands at how much of
+// the window's time has gone, so used-ahead-of-time reads at a glance. The height is the same
+// with or without the mark, so the layout does not move.
+export function meterSvg(frac: number, color: string, h = 10, elapsed?: number) {
   const x = Math.max(0, Math.min(1, frac)) * W
-  const fill = x > 0 ? `<rect width="${Math.max(h, x).toFixed(1)}" height="${h}" rx="${h / 2}" fill="${color}"/>` : ''
-  return `${open(W, h)}${track(W, h)}${fill}</svg>`
+  const H = h + 2 * MARK
+  const zones = (from: number, to: number, c: string, a: number) =>
+    `<rect x="${(from * W).toFixed(1)}" y="${MARK}" width="${((to - from) * W).toFixed(1)}" height="${h}" fill="${c}" fill-opacity="${a}"/>`
+  const clip = `<clipPath id="c"><rect y="${MARK}" width="${W}" height="${h}" rx="${h / 2}"/></clipPath>`
+  const bg = `<g clip-path="url(#c)"><rect y="${MARK}" width="${W}" height="${h}" fill="${GRAY}" fill-opacity=".2"/>${zones(AMBER_AT, RED_AT, '#eda100', 0.22)}${zones(RED_AT, 1, '#e34948', 0.26)}</g>`
+  const fill = x > 0 ? `<rect y="${MARK}" width="${Math.max(h, x).toFixed(1)}" height="${h}" rx="${h / 2}" fill="${color}"/>` : ''
+  const mark =
+    elapsed === undefined
+      ? ''
+      : (() => {
+          const m = Math.max(0, Math.min(1, elapsed)) * W
+          return `<line x1="${m.toFixed(1)}" x2="${m.toFixed(1)}" y1="0" y2="${H}" stroke="#fff" stroke-opacity=".85" stroke-width="4"/><line x1="${m.toFixed(1)}" x2="${m.toFixed(1)}" y1="0" y2="${H}" stroke="#3a3a37" stroke-width="2"/>`
+        })()
+  return `${open(W, H)}${clip}${bg}${fill}${mark}</svg>`
 }
 
 // A session's share of the range, split into what the main agent spent (solid)
@@ -51,32 +71,33 @@ export function stackSvg(parts: { frac: number; color: string; label: string }[]
   return `${open(W, h)}${track(W, h)}${clip}<g clip-path="url(#c)">${rects.join('')}</g></svg>`
 }
 
-// Usage over time, stacked by session; the colours match `report.timeline.keys`.
+// What the tallest bar of the timeline stands for, for the label under the chart.
+export function timelinePeak(report: Report) {
+  return Math.max(...report.timeline.rows.map(r => r.slice(1).reduce((s, v) => s + v, 0)), 0)
+}
+
+// Usage over time, stacked by session; the colours match `report.timeline.keys`. There is no text
+// in it: a picture cannot follow the theme, so the labels under it are drawn as text instead.
 export function timelineSvg(report: Report, metric: Metric, titles: Map<string, string>) {
   const { rows, keys, bucketMs } = report.timeline
-  const H = 140
-  const left = 46
-  const bottom = 18
-  const top = 8
-  const plotW = W - left - 4
-  const plotH = H - bottom - top
-  const sums = rows.map(r => r.slice(1).reduce((a, b) => a + b, 0))
-  const max = Math.max(...sums, 1e-9)
-  const slot = plotW / Math.max(rows.length, 1)
+  const H = 96
+  const top = 4
+  const plotH = H - top
+  const max = Math.max(timelinePeak(report), 1e-9)
+  const slot = W / Math.max(rows.length, 1)
   const gap = slot > 6 ? 2 : slot > 3 ? 1 : 0
   const tz = report.tzOffset
   const long = report.to - report.from > 2 * DAY
-  const style = `<style>text{font:10px system-ui,sans-serif;fill:${GRAY}}.g{stroke:${GRAY};stroke-opacity:.25;stroke-width:1}</style>`
+  const style = `<style>.g{stroke:${GRAY};stroke-opacity:.25;stroke-width:1}</style>`
   const parts: string[] = []
   for (const frac of [0.5, 1]) {
     const y = top + plotH * (1 - frac)
-    parts.push(`<line class="g" x1="${left}" x2="${W - 4}" y1="${y}" y2="${y}"/>`)
-    parts.push(`<text x="${left - 6}" y="${y + 3}" text-anchor="end">${xml(showValue(max * frac, metric))}</text>`)
+    parts.push(`<line class="g" x1="0" x2="${W}" y1="${y}" y2="${y}"/>`)
   }
-  parts.push(`<line class="g" x1="${left}" x2="${W - 4}" y1="${top + plotH}" y2="${top + plotH}"/>`)
+  parts.push(`<line class="g" x1="0" x2="${W}" y1="${top + plotH}" y2="${top + plotH}"/>`)
   rows.forEach((row, i) => {
     let y = top + plotH
-    const x = left + i * slot + gap / 2
+    const x = i * slot + gap / 2
     const w = Math.max(1, slot - gap)
     const at = row[0] ?? 0
     const when = `${clock(at, tz, long)}–${clock(at + bucketMs, tz, false)}`
@@ -91,11 +112,6 @@ export function timelineSvg(report: Report, metric: Metric, titles: Map<string, 
         `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${w.toFixed(1)}" height="${Math.max(0.5, h - (h > 3 ? 0.8 : 0)).toFixed(1)}" rx="1" fill="${color}"><title>${xml(`${when}  ${name}  ${showValue(v, metric)}`)}</title></rect>`,
       )
     })
-  })
-  const labelEvery = Math.max(1, Math.ceil(rows.length / 6))
-  rows.forEach((row, i) => {
-    if (i % labelEvery !== 0) return
-    parts.push(`<text x="${(left + i * slot).toFixed(1)}" y="${H - 4}">${xml(clock(row[0] ?? 0, tz, long))}</text>`)
   })
   return `${open(W, H, style)}${parts.join('')}</svg>`
 }

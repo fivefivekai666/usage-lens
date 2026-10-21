@@ -1,7 +1,8 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 
 import { money, parseAccountUsage } from '../hooks/account'
-import { calibrate, etaOf, firstToRunOut, remainingUsd, signedPercent, tightest, usdShort, windowRemaining } from '../hooks/format'
+import { meterSvg } from '../hooks/charts'
+import { bar, calibrate, etaOf, firstToRunOut, remainingUsd, signedPercent, tightest, usdShort, windowRemaining } from '../hooks/format'
 import { bandStat, modelName, specFor, summaryText } from '../hooks/register'
 import type { Limits, Report } from '../types'
 
@@ -130,6 +131,10 @@ describe('pane', () => {
       expect(await ui.find({ text: /最贵的子 agent/ })).toBeDefined()
       expect(await ui.find({ text: /Audit checkout tests/ })).toBeDefined()
       await ui.press({ key: 'row-s-big' })
+      // the timeline holds no text of its own; its scale is written under it, where a picture is drawn
+      const scale = await ui.find({ text: /峰值/ })
+      if (surface === 'terminal') expect(scale).toBeUndefined()
+      else expect(scale).toBeDefined()
       await ui.unmount()
     }
     expect(scans).toBe(2)
@@ -456,15 +461,34 @@ describe('when does it run out', () => {
     // 94% after four hours at a point an hour: 100% six hours on, which is 09:00 in a UTC-7 zone
     for (const surface of ['desktop', 'terminal'] as const) {
       const footer = await $.ui.mount({ plugin: 'usage-lens', surface, component: 'SessionMode', props: { modes: [] } })
-      expect((await footer.find({ key: 'usage-lens-footer' }))?.text).toContain('≈09:00 用完（7d）')
+      expect((await footer.find({ key: 'usage-lens-footer' }))?.text).toContain('▲≈09:00 用完（7d）')
       await footer.unmount()
       const props = { title: '用量透视', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} } as const
       const pane = await $.ui.mount({ plugin: 'usage-lens', surface, component: 'Pane', requestId: 'usage-lens', props })
       const line = await pane.find({ type: 'Text', text: /≈09:00 用完/ })
       expect(line?.text).toContain('10-14 05:00 重置（26h）')
       expect(line?.text).toContain('1.00点/h')
-      expect(line?.text).toContain('≈09:00 用完，限 20h')
+      expect(line?.text).toContain('▲ ≈09:00 用完，限 20h') // a warning is not left to its colour alone
       await pane.unmount()
     }
+  })
+})
+
+describe('the meter', () => {
+  test('is a bullet chart: zones from 75% and 90%, and a mark for the time that has gone', async () => {
+    const svg = meterSvg(0.5, '#2a78d6', 10, 0.25)
+    expect(svg).toContain('x1="130.0"') // a quarter of the 520 across
+    expect(svg).toContain('x="390.0"') // amber from 75%
+    expect(svg).toContain('x="468.0"') // red from 90%
+    expect(meterSvg(0.5, '#2a78d6', 10)).not.toContain('<line') // no mark when the time is not known
+    // the same height with and without the mark, so nothing moves when it appears
+    expect(meterSvg(0.5, '#2a78d6', 10)).toContain('height="16"')
+    expect(svg).toContain('height="16"')
+  })
+
+  test('on the terminal the mark takes a cell of the bar', async () => {
+    expect(bar(0.5, 10, 0.2)).toEqual({ on: '██│██', off: '░░░░░' })
+    expect(bar(0.5, 10, 0.9)).toEqual({ on: '█████', off: '░░░░│' })
+    expect(bar(0.5, 10)).toEqual({ on: '█████', off: '░░░░░' })
   })
 })

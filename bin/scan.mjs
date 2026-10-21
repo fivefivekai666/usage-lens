@@ -529,7 +529,7 @@ function main() {
     }
   })
 
-  const topKeys = list.slice(0, 8).map(s => s.sid)
+  const topKeys = list.slice(0, Math.max(1, Math.min(8, Number(args.series ?? 8)))).map(s => s.sid)
   const rows = []
   for (let i = 0; i < nBuckets; i++) {
     const vals = topKeys.map(k => round(series.get(k)?.[i] ?? 0))

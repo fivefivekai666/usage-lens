@@ -1,7 +1,7 @@
 import type { Elements } from 'claude-code'
 
 import type { Limit, Limits, Metric, ModelUse, Quota, Range, RangeKind, Report, Sample, Scan, SessionUse } from '../types'
-import { COLORS, OTHER, meterColor, meterSvg, shareSvg, stackSvg, timelineSvg } from './charts'
+import { COLORS, OTHER, meterColor, meterSvg, shareSvg, stackSvg, timelinePeak, timelineSvg } from './charts'
 import {
   HOUR,
   bar,
@@ -26,6 +26,9 @@ export type Ui = Elements[keyof Elements]
 
 // One piece of the line under a meter: plain, or coloured when it is a warning.
 type Seg = string | { text: string; tone: 'warning' | 'error' }
+
+// How long each window is, for how much of its time has gone.
+const SPAN: Record<string, number> = { five_hour: 5 * HOUR, seven_day: 7 * 24 * HOUR }
 
 export const RANGES: { kind: RangeKind; label: string; group: 'window' | 'recent' }[] = [
   { kind: 'window5h', label: '5h窗口', group: 'window' },
@@ -88,8 +91,8 @@ export function drawPane(ui: Ui, d: PaneData) {
     ) : null
 
   // A window's meter: name and percent, the bar, and one line of figures.
-  const meter = (key: string, label: string, pct: number, frac: number, color: string, segs: Seg[]) => {
-    const b = bar(frac, textW)
+  const meter = (key: string, label: string, pct: number, frac: number, color: string, segs: Seg[], elapsed?: number) => {
+    const b = bar(frac, textW, elapsed)
     const line: JSX.Element[] = []
     segs.forEach((seg, i) => {
       if (i > 0) {
@@ -120,7 +123,7 @@ export function drawPane(ui: Ui, d: PaneData) {
           </Text>
         </Box>
         {hasSvg ? (
-          svgBar(`${key}-bar`, meterSvg(frac, color), `${label}已用 ${pct}%`)
+          svgBar(`${key}-bar`, meterSvg(frac, color, 10, elapsed), `${label}已用 ${pct}%${elapsed === undefined ? '' : `，时间已过 ${Math.round(elapsed * 100)}%`}`)
         ) : (
           <Text>
             <Text color={severity(pct)}>{b.on}</Text>
@@ -209,7 +212,7 @@ export function drawPane(ui: Ui, d: PaneData) {
       segs.push(`${e.pace >= 10 ? e.pace.toFixed(1) : e.pace.toFixed(2)}点/h${e.isRough ? '（粗估）' : ''}`)
       segs.push(
         e.runsOutAt < e.resetsAt
-          ? { tone: e.runsOutAt - now < 2 * HOUR ? 'error' : 'warning', text: `≈${at(e.runsOutAt)} 用完，限 ${shortSpan(e.resetsAt - e.runsOutAt)}` }
+          ? { tone: e.runsOutAt - now < 2 * HOUR ? 'error' : 'warning', text: `▲ ≈${at(e.runsOutAt)} 用完，限 ${shortSpan(e.resetsAt - e.runsOutAt)}` }
           : `重置时≈${Math.round(e.atReset)}%`,
       )
     }
@@ -225,7 +228,12 @@ export function drawPane(ui: Ui, d: PaneData) {
     <Box key="limits" flexDirection="column" rowGap={1} borderStyle="round" borderColor="subtle" paddingX={1}>
       {limitRows.length > 0 ? (
         [
-          ...limitRows.map(l => meter(`limit-${l.kind}`, limitLabel(l.kind), l.percentUsed, l.percentUsed / 100, meterColor(l.percentUsed), figures(l))),
+          ...limitRows.map(l => {
+            const resets = l.resetsAt ? Date.parse(l.resetsAt) : NaN
+            const span = SPAN[l.kind]
+            const elapsed = span && Number.isFinite(resets) && now ? Math.max(0, Math.min(1, 1 - (resets - now) / span)) : undefined
+            return meter(`limit-${l.kind}`, limitLabel(l.kind), l.percentUsed, l.percentUsed / 100, meterColor(l.percentUsed), figures(l), elapsed)
+          }),
           ...(quota?.extra ? [extraMeter(quota.extra)] : []),
         ]
       ) : (
@@ -239,7 +247,7 @@ export function drawPane(ui: Ui, d: PaneData) {
       <Box flexDirection="column" rowGap={1}>
         {top}
         {limitCard}
-        {scan.error ? <Text color="error">出错：{scan.error}</Text> : <Text dimColor>{scan.isBusy ? '扫描中…' : '点「刷新」开始'}</Text>}
+        {scan.error ? <Text color="error">出错：{scan.error}。点「刷新」重试。</Text> : <Text dimColor>{scan.isBusy ? '扫描中…' : '点「刷新」开始'}</Text>}
       </Box>
     )
   }
@@ -277,10 +285,20 @@ export function drawPane(ui: Ui, d: PaneData) {
     </Box>
   )
 
+  // The chart holds no text (a picture cannot follow the theme); its scale is written under it.
   const chart =
-    hasSvg && report.timeline.rows.length > 1
-      ? svgBar('timeline', timelineSvg(report, metric, titles), '各时间段的用量，按会话堆叠')
-      : null
+    hasSvg && report.timeline.rows.length > 1 ? (
+      <Box key="timeline-box" flexDirection="column">
+        {svgBar('timeline', timelineSvg(report, metric, titles), '各时间段的用量，按会话堆叠')}
+        <Box flexDirection="row" justifyContent="space-between">
+          <Text dimColor>{clock(report.from, tz, long)}</Text>
+          <Text dimColor>
+            峰值 {showValue(timelinePeak(report), metric)} / {shortSpan(report.timeline.bucketMs)}
+          </Text>
+          <Text dimColor>{clock(report.to, tz, long)}</Text>
+        </Box>
+      </Box>
+    ) : null
 
   const modelItems = models.map((m, i) => ({
     color: COLORS[i] ?? OTHER,
@@ -319,6 +337,8 @@ export function drawPane(ui: Ui, d: PaneData) {
     const sv = valueOf(s.all, metric)
     const hasTypes = s.types.length > 1
     const rows = [
+      // the row clips a long title; here it is whole
+      ...((s.title || '').length > 46 ? [<Text key={`${s.sid}-title`} dimColor wrap="wrap">{s.title}</Text>, <Box key={`${s.sid}-title-gap`} height={1} />] : []),
       agentHead(`${s.sid}-main`, '主 agent', showValue(valueOf(s.main, metric), metric), sv ? valueOf(s.main, metric) / sv : 0),
       ...modelRows(s.sid, 'main', s.main.models ?? [], valueOf(s.main, metric)),
     ]
@@ -422,7 +442,7 @@ export function drawPane(ui: Ui, d: PaneData) {
   const sessions = (
     <Box key="sessions" flexDirection="column" rowGap={1}>
       {section('sessions-h', '会话', '点一行展开')}
-      {listed.length === 0 ? <Text dimColor>这个时段没有用量。</Text> : sessionRows}
+      {listed.length === 0 ? <Text dimColor>这个时段没有用量，换个时段看看。</Text> : sessionRows}
       {unlisted > 0 ? <Text dimColor>另有 {unlisted} 个未列出（用量很小或非 Claude）</Text> : null}
     </Box>
   )
@@ -434,7 +454,7 @@ export function drawPane(ui: Ui, d: PaneData) {
       {summary}
       {chart}
       {modelBlock}
-      {scan.error ? <Text color="error">上次扫描出错：{scan.error}</Text> : null}
+      {scan.error ? <Text color="error">上次扫描出错：{scan.error}。点「刷新」重试。</Text> : null}
       {sessions}
     </Box>
   )

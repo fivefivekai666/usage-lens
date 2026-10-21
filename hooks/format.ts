@@ -43,9 +43,12 @@ export function duration(ms: number) {
 }
 
 // A bar of block characters, for surfaces that cannot draw an Svg.
-export const bar = (frac: number, width: number) => {
+export const bar = (frac: number, width: number, mark?: number) => {
   const n = Math.max(0, Math.min(width, Math.round(frac * width)))
-  return { on: '█'.repeat(n), off: '░'.repeat(width - n) }
+  const cells = [...'█'.repeat(n), ...'░'.repeat(width - n)]
+  // a mark (how much of the window's time has gone) takes the place of one cell
+  if (mark !== undefined) cells[Math.max(0, Math.min(width - 1, Math.round(mark * width)))] = '│'
+  return { on: cells.slice(0, n).join(''), off: cells.slice(n).join('') }
 }
 
 export const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s)

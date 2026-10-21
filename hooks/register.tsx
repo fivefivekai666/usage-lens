@@ -101,8 +101,11 @@ let inflight: Promise<void> | undefined
 let isAgain = false
 let ticker: { cancel: () => void } | undefined
 
+// Five coloured sessions and the rest in grey: six colours at most, for a chart read at a glance.
+const SERIES = 5
+
 async function runScan($: EngineInterface, spec: string, metric: Metric, limit = 40, agents = 10): Promise<Report> {
-  const argv = [`${$.plugin.root}/bin/scan.mjs`, '--range', spec, '--metric', metric, '--limit', String(limit), '--agents', String(agents)]
+  const argv = [`${$.plugin.root}/bin/scan.mjs`, '--range', spec, '--metric', metric, '--limit', String(limit), '--agents', String(agents), '--series', String(SERIES)]
   let lastError: unknown
   for (const cmd of nodeCmd ? [nodeCmd] : NODE_CANDIDATES) {
     let ran
@@ -461,7 +464,7 @@ export const register: Register = on => {
           {points !== undefined && points >= 0.05 ? <Text dimColor> · 本会话{points.toFixed(1)}点</Text> : ''}
           {left ? <Text dimColor> · 剩{left.isExact ? '' : '≈'}{usdShort(left.remaining)}</Text> : ''}
           {extra ? <Text dimColor> · 额外剩{usdShort(extra.remaining)}</Text> : ''}
-          {runsOut ? <Text color={runsOut.isSoon ? 'error' : 'warning'}> · ≈{runsOut.text} 用完（{runsOut.label}）</Text> : ''}
+          {runsOut ? <Text color={runsOut.isSoon ? 'error' : 'warning'}> · ▲≈{runsOut.text} 用完（{runsOut.label}）</Text> : ''}
         </Button>
         {e.props.modes.length > 0 ? <Text dimColor> · {e.props.modes.join(' & ')}</Text> : null}
       </Box>
@@ -500,7 +503,7 @@ export const register: Register = on => {
           {points !== undefined && points >= 0.05 ? <Text dimColor> · 本会话{points.toFixed(1)}点{isWide ? `（${percent(share)}）` : ''}</Text> : ''}
           {left ? <Text dimColor> · 剩{left.isExact ? '' : '≈'}{usdShort(left.remaining)}</Text> : ''}
           {extra ? <Text dimColor> · 额外剩{usdShort(extra.remaining)}</Text> : ''}
-          {runsOut ? <Text color={runsOut.isSoon ? 'error' : 'warning'}> · ≈{runsOut.text} 用完（{runsOut.label}）</Text> : ''}
+          {runsOut ? <Text color={runsOut.isSoon ? 'error' : 'warning'}> · ▲≈{runsOut.text} 用完（{runsOut.label}）</Text> : ''}
           <Text color="suggestion"> ▸</Text>
         </Button>
       </Box>
