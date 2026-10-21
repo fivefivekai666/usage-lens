@@ -46,6 +46,8 @@ export type PaneData = {
   // `'Svg' in ui` is true on every surface (the terminal gets an empty stand-in), so the surface says.
   canSvg: boolean
   canInput: boolean
+  // how many points of the 5h window this session has used, when it is known
+  points?: number
   range: Range
   metric: Metric
   report: Report | null
@@ -197,16 +199,18 @@ export function drawPane(ui: Ui, d: PaneData) {
 
   const limitRows = (limits?.items ?? []).filter((l: Limit) => l.kind === 'five_hour' || l.kind === 'seven_day')
   const now = report?.now ?? limits?.at ?? 0
-  const tz = quota?.tz ?? report?.tzOffset ?? 0
+  const tzKnown = quota?.tz ?? report?.tzOffset // a clock time is only printed once the zone is known
+  const tz = tzKnown ?? 0
 
   // One line per window: when it resets, what is left, how fast it is going and where that ends.
   const figures = (l: Limit): Seg[] => {
-    const at = (ms: number) => clock(ms, tz, ms - now > 12 * HOUR)
+    const at = (ms: number) => (tzKnown === undefined ? `+${shortSpan(ms - now)}` : clock(ms, tz, ms - now > 12 * HOUR))
     const resets = l.resetsAt ? Date.parse(l.resetsAt) : NaN
     const segs: Seg[] = []
-    if (Number.isFinite(resets)) segs.push(`${at(resets)} 重置（${shortSpan(resets - now)}）`)
+    if (Number.isFinite(resets)) segs.push(tzKnown === undefined ? `${shortSpan(resets - now)} 后重置` : `${at(resets)} 重置（${shortSpan(resets - now)}）`)
     const left = windowLeft(quota, l, calib)
     if (left) segs.push(`剩${left.isExact ? '' : '≈'}${usd(left.usd)}${left.isRecent ? '（近期速率）' : ''}`)
+    if (l.kind === 'five_hour' && d.points !== undefined && d.points >= 0.05) segs.push(`本会话 ${d.points.toFixed(1)}点`)
     const e = etaOf(calib, l, now)
     if (e) {
       segs.push(`${e.pace >= 10 ? e.pace.toFixed(1) : e.pace.toFixed(2)}点/h${e.isRough ? '（粗估）' : ''}`)

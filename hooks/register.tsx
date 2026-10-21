@@ -196,6 +196,8 @@ async function openPane($: EngineInterface) {
 // ---------------------------------------------------------------- dollars left
 
 async function putWindow($: EngineInterface, w: QuotaWindow, at: number, tz: number) {
+  // the zone is kept across sessions, so a clock time is never printed before it is known
+  if ((await read($, quotaAtom))?.tz !== tz) await $.store.set('tz', tz)
   await update(
     $,
     quotaAtom,
@@ -331,14 +333,22 @@ async function readUsage($: EngineInterface) {
   const share = band && band.windowCost > 0 ? band.sessionCost / band.windowCost : 0
   const left = tightest(quota, windows, calib)
   const soonest = firstToRunOut(windows.map(l => etaOf(calib, l, now)))
+  const tz = quota?.tz ?? band?.tzOffset // not known until a scan has run or a zone was kept
   const runsOut = soonest
     ? {
         label: soonest.kind === 'five_hour' ? '5h' : '7d',
-        text: clock(soonest.runsOutAt, quota?.tz ?? band?.tzOffset ?? 0, soonest.runsOutAt - now > 12 * HOUR),
+        // for the footer, which has room for about 25 cells: "21:39"; "+31h" when it is far off or the zone is not known
+        short:
+          tz === undefined || soonest.runsOutAt - now > 12 * HOUR
+            ? `+${shortSpan(soonest.runsOutAt - now)}`
+            : clock(soonest.runsOutAt, tz, false),
         isSoon: soonest.runsOutAt - now < 2 * HOUR,
       }
     : undefined
-  return { five, week, fiveIn: toReset(five), weekIn: toReset(week), points, share, left, extra: quota?.extra, runsOut }
+  // a window that is used up: what matters then is how long until it frees up, the longest wait of them
+  const used = windows.filter(l => l.percentUsed >= 100 && l.resetsAt && Date.parse(l.resetsAt) > now)
+  const blocked = used.length ? shortSpan(Math.max(...used.map(l => Date.parse(l.resetsAt ?? '') - now))) : undefined
+  return { five, week, fiveIn: toReset(five), weekIn: toReset(week), points, share, left, extra: quota?.extra, runsOut, blocked }
 }
 
 async function openFromBand($: EngineInterface) {
@@ -392,6 +402,8 @@ export const register: Register = on => {
     const isBandOn = (await $.store.get('bandOn')) === true
     await update($, bandOnAtom, () => isBandOn)
     $.ui.status(undefined)
+    const savedTz = await $.store.get('tz')
+    if (typeof savedTz === 'number') await update($, quotaAtom, (q: Quota | null): Quota => ({ ...(q ?? { at: 0, windows: [] }), tz: savedTz }))
     const savedCalib = await $.store.get('calib')
     if (Array.isArray(savedCalib)) await update($, calibAtom, () => savedCalib as Sample[])
     const stored = (await $.store.get('limits')) as Limits | undefined
@@ -443,8 +455,12 @@ export const register: Register = on => {
   // In the footer beside the model: the 5h window, the week, this session's
   // points; a press opens the pane on the 5h window. The engine's own mode
   // labels (focus, memory paused) stay after it.
+  // The footer slot is short (about 25 cells at the desktop's default size, and what does not
+  // fit is cut off at the end), so only the two percentages and the one thing that matters most
+  // go in it: how long until a used-up window frees up, else a run-out warning, else the dollars left. Resets, session points and extra usage
+  // are in the pane a press away.
   on('ui.render', { component: 'SessionMode' }, async ($, e, next) => {
-    const { five, week, fiveIn, weekIn, points, left, extra, runsOut } = await readUsage($)
+    const { five, week, left, extra, runsOut, blocked } = await readUsage($)
     if (!five && !week) return next(e)
     const { Box, Button, Text } = $.ui.resolve(e)
     const pct = (n: number) => (
@@ -457,14 +473,19 @@ export const register: Register = on => {
         <Button key="usage-lens-footer" plain onPress={() => openFromBand($)}>
           {five ? <Text dimColor>5h </Text> : ''}
           {five ? pct(five.percentUsed) : ''}
-          {five && fiveIn ? <Text dimColor>（{fiveIn}）</Text> : ''}
           {week ? <Text dimColor>{five ? ' · ' : ''}7d </Text> : ''}
           {week ? pct(week.percentUsed) : ''}
-          {week && weekIn ? <Text dimColor>（{weekIn}）</Text> : ''}
-          {points !== undefined && points >= 0.05 ? <Text dimColor> · 本会话{points.toFixed(1)}点</Text> : ''}
-          {left ? <Text dimColor> · 剩{left.isExact ? '' : '≈'}{usdShort(left.remaining)}</Text> : ''}
-          {extra ? <Text dimColor> · 额外剩{usdShort(extra.remaining)}</Text> : ''}
-          {runsOut ? <Text color={runsOut.isSoon ? 'error' : 'warning'}> · ▲≈{runsOut.text} 用完（{runsOut.label}）</Text> : ''}
+          {blocked ? (
+            <Text color="error"> ↻{blocked}</Text>
+          ) : runsOut ? (
+            <Text color={runsOut.isSoon ? 'error' : 'warning'}> ▲{runsOut.label === '5h' ? '5h ' : ''}{runsOut.short}</Text>
+          ) : left ? (
+            <Text dimColor> · 剩{left.isExact ? '' : '≈'}{usdShort(left.remaining)}</Text>
+          ) : extra ? (
+            <Text dimColor> · 额外剩{usdShort(extra.remaining)}</Text>
+          ) : (
+            ''
+          )}
         </Button>
         {e.props.modes.length > 0 ? <Text dimColor> · {e.props.modes.join(' & ')}</Text> : null}
       </Box>
@@ -503,7 +524,7 @@ export const register: Register = on => {
           {points !== undefined && points >= 0.05 ? <Text dimColor> · 本会话{points.toFixed(1)}点{isWide ? `（${percent(share)}）` : ''}</Text> : ''}
           {left ? <Text dimColor> · 剩{left.isExact ? '' : '≈'}{usdShort(left.remaining)}</Text> : ''}
           {extra ? <Text dimColor> · 额外剩{usdShort(extra.remaining)}</Text> : ''}
-          {runsOut ? <Text color={runsOut.isSoon ? 'error' : 'warning'}> · ▲≈{runsOut.text} 用完（{runsOut.label}）</Text> : ''}
+          {runsOut ? <Text color={runsOut.isSoon ? 'error' : 'warning'}> · ▲{runsOut.label === '5h' ? '5h ' : ''}{runsOut.short} 用完</Text> : ''}
           <Text color="suggestion"> ▸</Text>
         </Button>
       </Box>
@@ -512,10 +533,12 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     ensureTicker($)
+    const { points } = await readUsage($)
     return drawPane($.ui.resolve(e), {
       cols: Math.max(40, e.props.bodyColumns),
       canSvg: e.surface !== 'terminal',
       canInput: e.surface !== 'mobile',
+      points,
       range: await read($, rangeAtom),
       metric: await read($, metricAtom),
       report: await read($, reportAtom),

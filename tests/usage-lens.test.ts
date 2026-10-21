@@ -326,8 +326,14 @@ describe('the account in dollars', () => {
       const text = (await ui.find({ key: 'usage-lens-footer' }))?.text ?? ''
       expect(text).toContain('剩$300')
       expect(text).not.toContain('剩≈') // the account's own figure is not marked approximate
-      expect(text).toContain('额外剩$37.5')
+      expect(text).not.toContain('额外') // the footer has room for one more thing, and that is the dollars left
       await ui.unmount()
+      // extra usage is in the pane, as a meter of its own
+      const props = { title: '用量透视', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} } as const
+      const pane = await $.ui.mount({ plugin: 'usage-lens', surface, component: 'Pane', requestId: 'usage-lens', props })
+      expect(await pane.find({ type: 'Text', text: '额外用量' })).toBeDefined()
+      expect(await pane.find({ type: 'Text', text: /剩 \$37\.5/ })).toBeDefined()
+      await pane.unmount()
     }
   })
 })
@@ -461,7 +467,7 @@ describe('when does it run out', () => {
     // 94% after four hours at a point an hour: 100% six hours on, which is 09:00 in a UTC-7 zone
     for (const surface of ['desktop', 'terminal'] as const) {
       const footer = await $.ui.mount({ plugin: 'usage-lens', surface, component: 'SessionMode', props: { modes: [] } })
-      expect((await footer.find({ key: 'usage-lens-footer' }))?.text).toContain('▲≈09:00 用完（7d）')
+      expect((await footer.find({ key: 'usage-lens-footer' }))?.text).toContain('7d 94% ▲09:00')
       await footer.unmount()
       const props = { title: '用量透视', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} } as const
       const pane = await $.ui.mount({ plugin: 'usage-lens', surface, component: 'Pane', requestId: 'usage-lens', props })
@@ -490,5 +496,97 @@ describe('the meter', () => {
     expect(bar(0.5, 10, 0.2)).toEqual({ on: '██│██', off: '░░░░░' })
     expect(bar(0.5, 10, 0.9)).toEqual({ on: '█████', off: '░░░░│' })
     expect(bar(0.5, 10)).toEqual({ on: '█████', off: '░░░░░' })
+  })
+})
+
+describe('the footer fits its slot', () => {
+  // The slot beside the model name holds about 25 cells at the desktop's default size and cuts what
+  // does not fit off at the end, so the most important part comes first and the whole stays short.
+  // A Chinese character or a full-width mark is two cells.
+  const cells = (s: string) => [...s].reduce((n, ch) => n + ((ch.codePointAt(0) ?? 0) >= 0x2e80 ? 2 : 1), 0)
+  const SLOT = 26
+
+  test('the widest footers it can have are within it', async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    mock.store(on)
+    on('session.measure', ($, e) => ({ changed: e.changed }))
+    on('process.run', () => ({
+      value: { exitCode: 0, stdout: JSON.stringify(REPORT), stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+    }))
+    // both windows at three digits, a dollar figure and a run-out warning could all want to be shown
+    await $.session.measure({
+      context: { window: 1_000_000 },
+      rateLimits: [
+        { kind: 'five_hour', percentUsed: 100, resetsAt: new Date(NOW + 2 * HOUR).toISOString() },
+        { kind: 'seven_day', percentUsed: 100, resetsAt: new Date(NOW + 30 * HOUR).toISOString() },
+      ],
+      changed: ['rateLimits'],
+    })
+    await clock.advance(1000)
+    const footer = await $.ui.mount({ plugin: 'usage-lens', surface: 'desktop', component: 'SessionMode', props: { modes: [] } })
+    const text = (await footer.find({ key: 'usage-lens-footer' }))?.text ?? ''
+    // nothing is left to estimate; how long until it frees up is what matters
+    expect(text).toContain('5h 100% · 7d 100% ↻30h')
+    expect(text).not.toContain('剩')
+    expect(cells(text)).toBeLessThanOrEqual(SLOT)
+    await footer.unmount()
+  })
+
+  test('a far-off run-out is a span, not a date', async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    mock.store(on)
+    on('session.measure', ($, e) => ({ changed: e.changed }))
+    on('process.run', () => ({
+      value: { exitCode: 0, stdout: JSON.stringify(REPORT), stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+    }))
+    // 70 -> 74 in four hours: 26 points to go at a point an hour is 26 hours away, before a reset 60 hours on
+    const resetsAt = new Date(NOW + 60 * HOUR).toISOString()
+    for (let i = 0; i < 5; i++) {
+      await $.session.measure({ context: { window: 1_000_000 }, rateLimits: [{ kind: 'seven_day', percentUsed: 70 + i, resetsAt }], changed: ['rateLimits'] })
+      await clock.advance(1000)
+      if (i < 4) await clock.advance(HOUR - 1000)
+    }
+    const footer = await $.ui.mount({ plugin: 'usage-lens', surface: 'desktop', component: 'SessionMode', props: { modes: [] } })
+    const text = (await footer.find({ key: 'usage-lens-footer' }))?.text ?? ''
+    expect(text).toContain('▲+26h')
+    expect(cells(text)).toBeLessThanOrEqual(SLOT)
+    await footer.unmount()
+  })
+
+  // Readings kept by an earlier session: a point an hour up to 94%, so 100% six hours on.
+  const kept = () => {
+    const resetsAt = new Date(NOW + 30 * HOUR).toISOString()
+    return {
+      calib: [90, 91, 92, 93, 94].map((pct, i) => ({ at: NOW + i * HOUR, kind: 'seven_day', resetsAt, pct, cost: 0 })),
+      limits: { at: NOW + 4 * HOUR, items: [{ kind: 'seven_day', percentUsed: 94, resetsAt }] },
+    }
+  }
+
+  test('a clock time is printed from the first draw when the zone was kept', async ($, on) => {
+    mock.clock(on, { now: NOW + 4 * HOUR })
+    mock.store(on, { ...kept(), tz: 420 }) // seven hours behind UTC
+    on('command.register', () => ({ value: { command: 'usage-lens' } }))
+    on('session.id', () => ({ value: 'boot' }))
+    on('session.usage', () => ({ value: { startedAt: 0, context: { window: 1_000_000 }, rateLimits: [] } }))
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
+    await $.session.start({ cwd: 'D:/', surface: 'desktop', isInteractive: true })
+    const footer = await $.ui.mount({ plugin: 'usage-lens', surface: 'desktop', component: 'SessionMode', props: { modes: [] } })
+    expect((await footer.find({ key: 'usage-lens-footer' }))?.text).toContain('▲09:00') // 16:00 UTC
+    await footer.unmount()
+  })
+
+  test('without the zone it says how long, never a clock time that could be wrong', async ($, on) => {
+    mock.clock(on, { now: NOW + 4 * HOUR })
+    mock.store(on, kept()) // no zone kept, and no scan has run yet
+    on('command.register', () => ({ value: { command: 'usage-lens' } }))
+    on('session.id', () => ({ value: 'boot' }))
+    on('session.usage', () => ({ value: { startedAt: 0, context: { window: 1_000_000 }, rateLimits: [] } }))
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
+    await $.session.start({ cwd: 'D:/', surface: 'desktop', isInteractive: true })
+    const footer = await $.ui.mount({ plugin: 'usage-lens', surface: 'desktop', component: 'SessionMode', props: { modes: [] } })
+    const text = (await footer.find({ key: 'usage-lens-footer' }))?.text ?? ''
+    expect(text).toContain('▲+6h')
+    expect(text).not.toMatch(/\d\d:\d\d/)
+    await footer.unmount()
   })
 })
